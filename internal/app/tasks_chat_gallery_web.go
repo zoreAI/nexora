@@ -1053,8 +1053,10 @@ func (s *Server) handleChatStreamImage(w http.ResponseWriter, r *http.Request, i
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), s.imageRequestTimeout())
 	defer cancel()
-	items, err := s.generateImageWithPool(ctx, prompt, model, strAny(b["size"], ""), strAny(b["resolution"], ""), extractChatImages(b))
 	w.Header().Set("Content-Type", "text/event-stream")
+	items, err := streamImageChatWithKeepalive(ctx, w, 15*time.Second, func() ([]upstreamImageResult, error) {
+		return s.generateImageWithPool(ctx, prompt, model, strAny(b["size"], ""), strAny(b["resolution"], ""), extractChatImages(b))
+	})
 	cid := "conv_" + randID(8)
 	if err != nil {
 		s.refundImage(id, 1)
@@ -1082,6 +1084,33 @@ func (s *Server) handleChatStreamImage(w http.ResponseWriter, r *http.Request, i
 	sse(w, map[string]any{"type": "conversation.delta", "delta": text, "text": text, "conversation_id": cid, "done": false})
 	sse(w, map[string]any{"type": "conversation.done", "text": text, "conversation_id": cid, "done": true})
 	sseDone(w)
+}
+
+func streamImageChatWithKeepalive(ctx context.Context, w http.ResponseWriter, interval time.Duration, generate func() ([]upstreamImageResult, error)) ([]upstreamImageResult, error) {
+	type result struct {
+		items []upstreamImageResult
+		err   error
+	}
+	results := make(chan result, 1)
+	fmt.Fprint(w, ": stream-open\n\n")
+	flushSSE(w)
+	go func() {
+		items, err := generate()
+		results <- result{items: items, err: err}
+	}()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case completed := <-results:
+			return completed.items, completed.err
+		case <-ticker.C:
+			fmt.Fprint(w, ": keep-alive\n\n")
+			flushSSE(w)
+		}
+	}
 }
 
 func (s *Server) upsertChatConversationFromStream(id *Identity, b map[string]any, upstreamCID, messageID, currentNode, token, assistantText string) {
