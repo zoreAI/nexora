@@ -82,7 +82,7 @@ func (p *accountPool) pickTokenExcluding(accounts []Account, needCodex bool, cod
 			if a.Status == "禁用" {
 				continue
 			}
-			if a.Status == "异常" {
+			if a.Status == "异常" || a.Status == "封号" {
 				continue
 			}
 			if a.Status == "限流" {
@@ -149,7 +149,7 @@ func (p *accountPool) pickTextTokenExcluding(accounts []Account, planType string
 		for offset := 0; offset < len(accounts); offset++ {
 			idx := (p.index + offset) % len(accounts)
 			a := accounts[idx]
-			if a.AccessToken == "" || excluded[a.AccessToken] || a.Status == "禁用" || a.Status == "异常" || isSignupAccessToken(a.AccessToken) != (signupPass == 1) {
+			if a.AccessToken == "" || excluded[a.AccessToken] || a.Status == "禁用" || a.Status == "异常" || a.Status == "封号" || isSignupAccessToken(a.AccessToken) != (signupPass == 1) {
 				continue
 			}
 			lower := strings.ToLower(a.Type)

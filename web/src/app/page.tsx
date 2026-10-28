@@ -133,6 +133,7 @@ export default function HomePage() {
     { label: "正常账号", value: accounts?.statuses["正常"], icon: CheckCircle2, tone: "bg-emerald-100 text-emerald-700" },
     { label: "限流账号", value: accounts?.statuses["限流"], icon: Clock3, tone: "bg-amber-100 text-amber-700" },
     { label: "异常账号", value: accounts?.statuses["异常"], icon: AlertCircle, tone: "bg-rose-100 text-rose-700" },
+    { label: "封号账号", value: accounts?.statuses["封号"], icon: Ban, tone: "bg-red-100 text-red-800" },
     { label: "禁用账号", value: accounts?.statuses["禁用"], icon: Ban, tone: "bg-slate-100 text-slate-700" },
     { label: accounts?.unknown_quota ? "已知剩余额度" : "剩余额度", value: accounts?.remaining_quota, icon: Coins, tone: "bg-cyan-100 text-cyan-700" },
   ];

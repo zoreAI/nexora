@@ -158,7 +158,8 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
       resetState();
 
       const signupCount = data.signup_tokens ?? 0;
-      const summary = `${successText ?? "导入完成"}，新增 ${data.added ?? 0} 个，资料刷新 ${data.refreshed ?? 0} 个`;
+      const mergedNote = data.merged ? `，同邮箱合并 ${data.merged} 个` : "";
+      const summary = `${successText ?? "导入完成"}，新增 ${data.added ?? 0} 个${mergedNote}，资料刷新 ${data.refreshed ?? 0} 个`;
       const signupNote = signupCount > 0 ? `，其中 ${signupCount} 个带注册阶段标记` : "";
       if ((data.errors?.length ?? 0) > 0) {
         const firstError = data.errors?.[0]?.error;

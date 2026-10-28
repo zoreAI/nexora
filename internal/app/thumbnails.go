@@ -1,9 +1,11 @@
 package app
 
 import (
+	"bytes"
 	"image"
 	"image/jpeg"
 	_ "image/png"
+	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -24,27 +26,47 @@ func (s *Server) serveThumbnail(w http.ResponseWriter, r *http.Request, rel stri
 		http.ServeFile(w, r, thumb)
 		return
 	}
-	src, err := s.imagePath(rel)
+	entry := s.imageIndex()[rel]
+	if entry.R2ThumbnailKey != "" {
+		if data, err := s.imageStorageSettings().r2Get(r.Context(), entry.R2ThumbnailKey); err == nil {
+			w.Header().Set("Content-Type", "image/jpeg")
+			_, _ = w.Write(data)
+			return
+		}
+	}
+	data, err := s.readStoredImage(r.Context(), rel)
 	if err != nil {
-		http.NotFound(w, r)
+		if os.IsNotExist(err) {
+			http.NotFound(w, r)
+		} else {
+			http.Error(w, "image storage unavailable", http.StatusBadGateway)
+		}
 		return
 	}
-	f, err := os.Open(src)
+	thumbnail, err := encodeImageThumbnail(data)
 	if err != nil {
-		http.NotFound(w, r)
+		w.Header().Set("Content-Type", mime.TypeByExtension(filepath.Ext(rel)))
+		_, _ = w.Write(data)
 		return
 	}
-	defer f.Close()
-	img, _, err := image.Decode(f)
-	if err != nil {
-		http.ServeFile(w, r, src)
+	_ = os.MkdirAll(filepath.Dir(thumb), 0755)
+	if err := os.WriteFile(thumb, thumbnail, 0644); err != nil {
+		w.Header().Set("Content-Type", "image/jpeg")
+		_, _ = w.Write(thumbnail)
 		return
+	}
+	http.ServeFile(w, r, thumb)
+}
+
+func encodeImageThumbnail(data []byte) ([]byte, error) {
+	img, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
 	}
 	bounds := img.Bounds()
 	w0, h0 := bounds.Dx(), bounds.Dy()
 	if w0 <= 0 || h0 <= 0 {
-		http.ServeFile(w, r, src)
-		return
+		return nil, image.ErrFormat
 	}
 	maxSide := 360
 	nw, nh := w0, h0
@@ -63,13 +85,9 @@ func (s *Server) serveThumbnail(w http.ResponseWriter, r *http.Request, rel stri
 			dst.Set(x, y, img.At(sx, sy))
 		}
 	}
-	_ = os.MkdirAll(filepath.Dir(thumb), 0755)
-	out, err := os.Create(thumb)
-	if err != nil {
-		http.ServeFile(w, r, src)
-		return
+	var out bytes.Buffer
+	if err := jpeg.Encode(&out, dst, &jpeg.Options{Quality: 82}); err != nil {
+		return nil, err
 	}
-	defer out.Close()
-	_ = jpeg.Encode(out, dst, &jpeg.Options{Quality: 82})
-	http.ServeFile(w, r, thumb)
+	return out.Bytes(), nil
 }

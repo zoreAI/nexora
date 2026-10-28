@@ -42,6 +42,14 @@ func isInvalidTokenErrorText(err error) bool {
 		strings.Contains(text, "authentication token has been invalidated")
 }
 
+func isAccountDeactivatedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "code=account_deactivated") || strings.Contains(text, `"code":"account_deactivated"`)
+}
+
 func isAutoConversationModelNotFound(err error, model string) bool {
 	if err == nil || normalizeTextModelOptions(model).Model != "auto" {
 		return false
@@ -157,6 +165,9 @@ func (s *Server) markAccountFailure(token string, err error, image bool, model s
 			}
 			accounts[i].Fail++
 			accounts[i].LastUsedAt = &now
+			if accounts[i].Status == "封号" {
+				return accounts
+			}
 			if isRateLimitErrorText(err) {
 				accounts[i].Status = "限流"
 				reset := time.Now().UTC().Add(rateLimitRestoreDelay(err)).Format(time.RFC3339)
@@ -166,8 +177,13 @@ func (s *Server) markAccountFailure(token string, err error, image bool, model s
 				if s.cfg.AutoRemoveRateLimitedAccounts {
 					accounts = append(accounts[:i], accounts[i+1:]...)
 				}
+			} else if isAccountDeactivatedError(err) {
+				accounts[i].Status = "封号"
+				accounts[i].Quota = 0
 			} else if isInvalidTokenErrorText(err) || (!image && isAutoConversationModelNotFound(err, model)) {
-				accounts[i].Status = "异常"
+				if accounts[i].Status != "封号" {
+					accounts[i].Status = "异常"
+				}
 				if isInvalidTokenErrorText(err) {
 					accounts[i].Quota = 0
 				}
@@ -184,7 +200,12 @@ func (s *Server) markAccountFailure(token string, err error, image bool, model s
 func applyAccountFailureState(account *Account, err error, now string) {
 	account.Fail++
 	account.LastUsedAt = &now
-	if isRateLimitErrorText(err) {
+	if isAccountDeactivatedError(err) {
+		account.Status = "封号"
+		account.Quota = 0
+	} else if account.Status == "封号" {
+		return
+	} else if isRateLimitErrorText(err) {
 		account.Status = "限流"
 		reset := time.Now().UTC().Add(rateLimitRestoreDelay(err)).Format(time.RFC3339)
 		account.RestoreAt = &reset

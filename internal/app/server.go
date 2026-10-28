@@ -27,6 +27,7 @@ type Server struct {
 	galleryMu           sync.Mutex
 	logMu               sync.Mutex
 	imageCleanupMu      sync.Mutex
+	imageStorageMu      sync.Mutex
 	lastImageCleanup    time.Time
 	proxyCursor         uint64
 	imageEgressMu       sync.Mutex
@@ -38,6 +39,7 @@ type Server struct {
 	imageTasks          *imageTaskRunner
 	accountPool         *accountPool
 	accountRefreshJobs  accountRefreshJobs
+	accountRepairJobs   accountRefreshJobs
 	logSvc              *logService
 	register            *registerService
 }
@@ -53,6 +55,11 @@ func NewServer(root string) (*Server, error) {
 	}
 	if strings.TrimSpace(cfg.AuthKey) == "" {
 		return nil, errors.New("auth-key 未设置")
+	}
+	if raw, ok := cfg.Extra["image_storage"]; ok {
+		if _, err := parseImageStorageSettings(raw); err != nil {
+			return nil, fmt.Errorf("invalid image_storage config: %w", err)
+		}
 	}
 	if cfg.RefreshAccountIntervalMinute <= 0 {
 		cfg.RefreshAccountIntervalMinute = 60
@@ -164,6 +171,7 @@ func (s *Server) configMap(includeAuth bool) map[string]any {
 	m["image_account_concurrency"] = s.cfg.ImageAccountConcurrency
 	m["cleanup_protect_gallery"] = s.cfg.CleanupProtectGallery
 	m["cleanup_protect_user_images"] = s.cfg.CleanupProtectUserImages
+	m["image_storage"] = s.imageStorageSettings()
 	if _, ok := m["backup"]; !ok {
 		m["backup"] = disabledBackupSettings()
 	}
@@ -211,11 +219,16 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/accounts/refresh", s.handleAccountsRefresh)
 	s.mux.HandleFunc("/api/accounts/refresh/start", s.handleAccountsRefreshStart)
 	s.mux.HandleFunc("/api/accounts/refresh/progress/", s.handleAccountsRefreshProgress)
+	s.mux.HandleFunc("/api/accounts/repair/start", s.handleAccountsRepairStart)
+	s.mux.HandleFunc("/api/accounts/repair/progress/", s.handleAccountsRepairProgress)
 	s.mux.HandleFunc("/api/accounts/update", s.handleAccountsUpdate)
 	s.mux.HandleFunc("/api/accounts/mfa/code", s.handleAccountMFACode)
+	s.mux.HandleFunc("/api/accounts/mfa/login", s.handleAccountMFALogin)
 	s.mux.HandleFunc("/api/account-groups", s.handleAccountGroups)
 	s.mux.HandleFunc("/api/account-groups/", s.handleAccountGroupID)
 	s.mux.HandleFunc("/api/settings", s.handleSettings)
+	s.mux.HandleFunc("/api/image-storage/test", s.handleImageStorageTest)
+	s.mux.HandleFunc("/api/image-storage/sync", s.handleImageStorageSync)
 	s.mux.HandleFunc("/api/storage/info", s.handleStorageInfo)
 	s.mux.HandleFunc("/api/system/status", s.handleSystemStatus)
 	s.mux.HandleFunc("/api/transport/status", s.handleSystemStatus)
@@ -278,7 +291,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/v1/chat/completions", s.handleV1ChatCompletions)
 	s.mux.HandleFunc("/v1/responses", s.handleV1Responses)
 	s.mux.HandleFunc("/v1/messages", s.handleV1Messages)
-	s.mux.Handle("/images/", http.StripPrefix("/images/", http.FileServer(http.Dir(s.imagesDir))))
+	s.mux.HandleFunc("/images/", s.handleStoredImage)
 	s.mux.HandleFunc("/", s.handleWeb)
 }
 

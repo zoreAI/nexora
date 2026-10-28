@@ -50,6 +50,30 @@ func TestAccountRefreshBatchHonorsCancellation(t *testing.T) {
 	}
 }
 
+func TestAccountRefreshBatchAllowsEmailReloginTime(t *testing.T) {
+	email := "alias@icloud.com"
+	accounts := []Account{{AccessToken: "icloud", Email: &email}, {AccessToken: "token-only"}}
+	results := runAccountRefreshBatch(context.Background(), accounts, func(ctx context.Context, account Account) error {
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			return errors.New("refresh context has no deadline")
+		}
+		remaining := time.Until(deadline)
+		if account.AccessToken == "icloud" && remaining < 2*time.Minute {
+			return fmt.Errorf("iCloud OTP refresh only has %s", remaining)
+		}
+		if account.AccessToken == "token-only" && remaining > time.Minute {
+			return fmt.Errorf("token-only refresh has %s", remaining)
+		}
+		return nil
+	})
+	for i, err := range results {
+		if err != nil {
+			t.Fatalf("account %d: %v", i, err)
+		}
+	}
+}
+
 func TestAccountRefreshSlotSharedAndCancelable(t *testing.T) {
 	s := &Server{accountPool: &accountPool{refreshSlots: make(chan struct{}, 1)}}
 	release, err := s.acquireAccountRefreshSlot(context.Background())

@@ -4,11 +4,71 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 )
 
+func (s *Server) handleAccountMFALogin(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.requireAdmin(w, r); !ok {
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var body struct {
+		AccessToken string `json:"access_token"`
+	}
+	if !readBody(w, r, &body) {
+		return
+	}
+	var account *Account
+	for _, item := range s.store.LoadAccounts() {
+		if item.AccessToken == strings.TrimSpace(body.AccessToken) {
+			account = &item
+			break
+		}
+	}
+	if account == nil {
+		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+	if account.Status != "异常" || ptrString(account.Email) == "" || ptrString(account.Password) == "" || ptrString(account.MFASecret) == "" {
+		writeErr(w, http.StatusBadRequest, "仅支持已保存邮箱、密码和 2FA 密钥的异常账号")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
+	defer cancel()
+	next, err := s.reLoginAccountWithPasswordSecret(ctx, *account, ptrString(account.MFASecret))
+	if err != nil {
+		if isAccountDeactivatedError(err) {
+			if saveErr := s.recordReLoginFailure(account.AccessToken, err); saveErr != nil {
+				writeErr(w, http.StatusInternalServerError, "保存账号异常状态失败")
+				return
+			}
+		}
+		message := err.Error()
+		for _, secret := range []string{account.AccessToken, ptrString(account.Password), ptrString(account.MFASecret), ptrString(account.RefreshToken), ptrString(account.IDToken)} {
+			if secret != "" {
+				message = strings.ReplaceAll(message, secret, "[redacted]")
+			}
+		}
+		writeErr(w, http.StatusBadGateway, truncateText(message, 500))
+		return
+	}
+	if err := s.persistReLoginAccount(account.AccessToken, next); err != nil {
+		writeErr(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
 func (s *Server) reLoginAccountWithPassword(ctx context.Context, old Account) (Account, error) {
+	return s.reLoginAccountWithPasswordSecret(ctx, old, "")
+}
+
+func (s *Server) reLoginAccountWithPasswordSecret(ctx context.Context, old Account, mfaSecret string) (Account, error) {
 	email := ptrString(old.Email)
 	password := ptrString(old.Password)
 	if email == "" || password == "" {
@@ -23,7 +83,9 @@ func (s *Server) reLoginAccountWithPassword(ctx context.Context, old Account) (A
 		return Account{}, err
 	}
 	defer session.close()
-	tokens, err := session.loginWithPassword(ctx, email, password)
+	tokens, err := session.loginWithPassword(ctx, email, password, mfaSecret, func(ctx context.Context, codeNotBefore time.Time) (string, error) {
+		return s.waitAccountEmailCode(ctx, session, old, email, ptrString(old.EmailPassword), codeNotBefore)
+	})
 	if err != nil {
 		return Account{}, err
 	}
@@ -63,8 +125,8 @@ func (s *Server) reLoginAccountWithEmailCode(ctx context.Context, old Account) (
 	if emailPassword == "" && old.Mailbox != nil {
 		emailPassword = strings.TrimSpace(strAny(old.Mailbox["password"], ""))
 	}
-	if email == "" || emailPassword == "" {
-		return Account{}, errors.New("账号缺少邮箱或邮箱密码，无法邮箱验证码登录")
+	if email == "" || !s.canReadAccountEmailCode(old) {
+		return Account{}, errors.New("账号缺少邮箱或可用的邮箱验证码读取方式")
 	}
 	proxyURL, err := s.selectedProxyForAccount(old)
 	if err != nil {
@@ -82,6 +144,13 @@ func (s *Server) reLoginAccountWithEmailCode(ctx context.Context, old Account) (
 		if err != nil {
 			return Account{}, err
 		}
+	}
+	if strings.HasPrefix(session.lastAuthorizeLanding, "choice path=") {
+		if err := session.authorizeContinue(ctx, deviceID, email); err != nil {
+			return Account{}, err
+		}
+	} else if !strings.HasPrefix(session.lastAuthorizeLanding, "verification path=") {
+		return Account{}, fmt.Errorf("授权未进入邮箱验证码步骤: %s", session.lastAuthorizeLanding)
 	}
 	codeNotBefore := time.Now().UTC()
 	if err := session.sendOTP(ctx, deviceID); err != nil {
@@ -134,6 +203,9 @@ func (s *Server) reLoginAccountWithEmailCode(ctx context.Context, old Account) (
 }
 
 func (s *Server) waitAccountEmailCode(ctx context.Context, session *registerSession, account Account, email, emailPassword string, codeNotBefore time.Time) (string, error) {
+	if s.canReadICloudAccountEmailCode(account) {
+		return s.waitICloudAccountEmailCode(ctx, session, email, codeNotBefore)
+	}
 	if account.Mailbox != nil {
 		clientID := strings.TrimSpace(strAny(account.Mailbox["client_id"], ""))
 		refreshToken := strings.TrimSpace(strAny(account.Mailbox["refresh_token"], ""))
@@ -169,6 +241,69 @@ func (s *Server) waitAccountEmailCode(ctx context.Context, session *registerSess
 	return waitForIMAPCodeWithLogin(ctx, email, loginEmail, emailPassword, imapHost, codeNotBefore, 90, 3)
 }
 
+func (s *Server) canReadICloudAccountEmailCode(account Account) bool {
+	email := strings.ToLower(strings.TrimSpace(ptrString(account.Email)))
+	if account.Mailbox != nil && strings.EqualFold(strings.TrimSpace(strAny(account.Mailbox["provider"], "")), "icloud_api") {
+		return true
+	}
+	if !strings.HasSuffix(email, "@icloud.com") || s.register == nil {
+		return false
+	}
+	for _, entry := range s.register.snapshot().Mail.Providers {
+		if strings.EqualFold(strings.TrimSpace(strAny(entry["type"], "")), "icloud_api") && boolAny(entry["enable"], true) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) canReadAccountEmailCode(account Account) bool {
+	if ptrString(account.Email) == "" {
+		return false
+	}
+	if s.canReadICloudAccountEmailCode(account) || ptrString(account.EmailPassword) != "" {
+		return true
+	}
+	if account.Mailbox == nil {
+		return false
+	}
+	return strings.TrimSpace(strAny(account.Mailbox["password"], "")) != "" ||
+		(strings.TrimSpace(strAny(account.Mailbox["client_id"], "")) != "" && strings.TrimSpace(strAny(account.Mailbox["refresh_token"], "")) != "")
+}
+
+func (s *Server) waitICloudAccountEmailCode(ctx context.Context, session *registerSession, email string, codeNotBefore time.Time) (string, error) {
+	if s.register == nil {
+		return "", errors.New("iCloud Privacy Mail 未配置")
+	}
+	mail := s.register.snapshot().Mail
+	for _, configured := range mail.Providers {
+		if !strings.EqualFold(strings.TrimSpace(strAny(configured["type"], "")), "icloud_api") || !boolAny(configured["enable"], true) {
+			continue
+		}
+		entry := make(map[string]any, len(configured)+2)
+		for key, value := range configured {
+			entry[key] = value
+		}
+		if entry["wait_timeout"] == nil {
+			entry["wait_timeout"] = mail.WaitTimeout
+		}
+		if entry["wait_interval"] == nil {
+			entry["wait_interval"] = mail.WaitInterval
+		}
+		provider := &iCloudAPIRegisterProvider{registerProviderBase: registerProviderBase{sess: session}, entry: entry}
+		if !mail.APIUseRegisterProxy {
+			var err error
+			provider.mailSess, err = newRegisterSession("", mail.RequestTimeout, nil)
+			if err != nil {
+				return "", err
+			}
+			defer provider.mailSess.close()
+		}
+		return provider.WaitForCode(ctx, &registerMailbox{Provider: "icloud_api", Address: email, CodeNotBefore: codeNotBefore})
+	}
+	return "", errors.New("iCloud Privacy Mail provider 未启用")
+}
+
 func (s *Server) reLoginAccounts(ctx context.Context, tokens []string) (int, int, []map[string]any, []map[string]any) {
 	want := map[string]bool{}
 	for _, token := range tokens {
@@ -194,12 +329,17 @@ func (s *Server) reLoginAccounts(ctx context.Context, tokens []string) (int, int
 				if err != nil {
 					refreshErr = err
 				} else {
+					next.Status = "正常"
+					if err := s.persistReLoginAccount(next.AccessToken, next); err != nil {
+						errs = append(errs, map[string]any{"token": accounts[i].AccessToken, "email": ptrString(accounts[i].Email), "error": err.Error()})
+						continue
+					}
 					accounts[i] = next
 					relogined++
 					continue
 				}
 			}
-			if ptrString(accounts[i].Email) != "" && (ptrString(accounts[i].EmailPassword) != "" || (accounts[i].Mailbox != nil && strings.TrimSpace(strAny(accounts[i].Mailbox["password"], "")) != "")) {
+			if s.canReadAccountEmailCode(accounts[i]) {
 				itemCtx, cancel := context.WithTimeout(ctx, 180*time.Second)
 				next, err := s.reLoginAccountWithEmailCode(itemCtx, accounts[i])
 				cancel()
@@ -231,7 +371,7 @@ func (s *Server) reLoginAccounts(ctx context.Context, tokens []string) (int, int
 			skippedItems = append(skippedItems, map[string]any{
 				"token":  accounts[i].AccessToken,
 				"email":  ptrString(accounts[i].Email),
-				"reason": "账号缺少 OpenAI 登录密码、refresh_token 或邮箱密码",
+				"reason": "账号缺少登录密码、refresh_token 或可取码的邮箱",
 			})
 			continue
 		}
@@ -245,7 +385,7 @@ func (s *Server) reLoginAccounts(ctx context.Context, tokens []string) (int, int
 			continue
 		}
 		itemCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
-		next, err := s.reLoginAccountWithPassword(itemCtx, accounts[i])
+		next, err := s.reLoginAccountWithPasswordSecret(itemCtx, accounts[i], ptrString(accounts[i].MFASecret))
 		cancel()
 		if err != nil {
 			if saveErr := s.recordReLoginFailure(accounts[i].AccessToken, err); saveErr != nil {

@@ -46,6 +46,8 @@ type ReplyTarget = {
 type ImageComposerProps = {
   prompt: string;
   imageCount: string;
+  imageModel: string;
+  imageModels: string[];
   imageSize: string;
   imageResolution: string;
   canUseHighResolution: boolean;
@@ -58,6 +60,7 @@ type ImageComposerProps = {
   onCancelReply?: () => void;
   onPromptChange: (value: string) => void;
   onImageCountChange: (value: string) => void;
+  onImageModelChange: (value: string) => void;
   onImageSizeChange: (value: string) => void;
   onImageResolutionChange: (value: string) => void;
   onSubmit: () => void | Promise<void>;
@@ -70,6 +73,8 @@ type ImageComposerProps = {
 export function ImageComposer({
   prompt,
   imageCount,
+  imageModel,
+  imageModels,
   imageSize,
   imageResolution,
   canUseHighResolution,
@@ -82,6 +87,7 @@ export function ImageComposer({
   onCancelReply,
   onPromptChange,
   onImageCountChange,
+  onImageModelChange,
   onImageSizeChange,
   onImageResolutionChange,
   onSubmit,
@@ -377,6 +383,15 @@ export function ImageComposer({
             <div className="rounded-b-[24px] border-t border-stone-100 bg-white px-3 pb-3 pt-2 sm:border-t-0 sm:px-6 sm:pb-5 sm:pt-3" onClick={(event) => event.stopPropagation()}>
               <div className="flex items-end justify-between gap-2 sm:gap-3">
                 <div className="hide-scrollbar flex min-w-0 flex-1 flex-nowrap items-center gap-1.5 overflow-x-auto pb-0.5 sm:flex-wrap sm:gap-3 sm:overflow-visible sm:pb-0">
+                  <select
+                    aria-label="图片模型"
+                    title="图片模型"
+                    value={imageModel}
+                    onChange={(event) => onImageModelChange(event.target.value)}
+                    className="h-9 max-w-[180px] shrink-0 cursor-pointer rounded-full border-0 bg-stone-100 px-3 text-[12px] font-medium text-stone-700 outline-none sm:h-10 sm:text-[13px]"
+                  >
+                    {imageModels.map((model) => <option key={model} value={model}>{model}</option>)}
+                  </select>
                   <button
                     type="button"
                     className="inline-flex h-9 shrink-0 cursor-pointer items-center gap-1.5 rounded-full bg-stone-100 px-3 text-[12px] font-medium text-stone-700 transition hover:bg-stone-200 sm:h-10 sm:gap-2 sm:px-4 sm:text-[13px]"

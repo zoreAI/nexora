@@ -36,15 +36,22 @@ func (s *Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		tokset := map[string]map[string]any{}
+		importedTokens := []string{}
 		for _, t := range body.Tokens {
 			t = strings.TrimSpace(t)
 			if t != "" {
+				if _, ok := tokset[t]; !ok {
+					importedTokens = append(importedTokens, t)
+				}
 				tokset[t] = map[string]any{"access_token": t}
 			}
 		}
 		for _, rec := range append(body.Accounts, body.AccountRecords...) {
 			t := strings.TrimSpace(strAny(rec["access_token"], strAny(rec["accessToken"], "")))
 			if t != "" {
+				if _, ok := tokset[t]; !ok {
+					importedTokens = append(importedTokens, t)
+				}
 				tokset[t] = rec
 			}
 		}
@@ -92,6 +99,7 @@ func (s *Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 			rec["proxy"] = normalized
 		}
 		added, skipped, signupTokens := 0, 0, 0
+		newTokens := map[string]bool{}
 		for token := range tokset {
 			if isSignupAccessToken(token) {
 				signupTokens++
@@ -111,6 +119,7 @@ func (s *Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 					skipped++
 				} else {
 					accounts = append(accounts, a)
+					newTokens[token] = true
 					added++
 				}
 			}
@@ -119,10 +128,23 @@ func (s *Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusInternalServerError, "保存账号失败: "+err.Error())
 			return
 		}
-		refreshed, errs := s.refreshAccountInfos(r.Context(), keysOf(tokset))
+		refreshed, errs, finalTokens := s.refreshAccountInfosWithFinalTokens(r.Context(), importedTokens)
+		failed := map[string]bool{}
+		for _, item := range errs {
+			failed[strAny(item["token"], "")] = true
+		}
+		merged := 0
+		if err := s.store.UpdateAccounts(func(accounts []Account) []Account {
+			accounts, merged = mergeImportedEmails(accounts, importedTokens, finalTokens, newTokens, failed)
+			return accounts
+		}); err != nil {
+			writeErr(w, http.StatusInternalServerError, "合并同邮箱账号失败: "+err.Error())
+			return
+		}
+		added = max(0, added-merged)
 		accounts := s.store.LoadAccounts()
-		s.logSvc.add("account", "新增账号", map[string]any{"added": added, "skipped": skipped, "refreshed": refreshed})
-		writeJSON(w, 200, map[string]any{"added": added, "skipped": skipped, "refreshed": refreshed, "signup_tokens": signupTokens, "errors": errs, "items": accounts})
+		s.logSvc.add("account", "新增账号", map[string]any{"added": added, "skipped": skipped, "merged": merged, "refreshed": refreshed})
+		writeJSON(w, 200, map[string]any{"added": added, "skipped": skipped, "merged": merged, "refreshed": refreshed, "signup_tokens": signupTokens, "errors": errs, "items": accounts})
 	case http.MethodDelete:
 		var body struct {
 			Tokens []string `json:"tokens"`
@@ -156,6 +178,65 @@ func (s *Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeErr(w, 405, "method not allowed")
 	}
+}
+
+func accountEmailKey(email *string) string {
+	return strings.ToLower(strings.TrimSpace(ptrString(email)))
+}
+
+func mergeImportedEmails(accounts []Account, importedTokens []string, finalTokens map[string]string, newTokens, failed map[string]bool) ([]Account, int) {
+	merged := 0
+	for _, originalToken := range importedTokens {
+		token := originalToken
+		if finalTokens[originalToken] != "" {
+			token = finalTokens[originalToken]
+		}
+		importedIndex := -1
+		for i := range accounts {
+			if accounts[i].AccessToken == token {
+				importedIndex = i
+				break
+			}
+		}
+		if importedIndex < 0 {
+			continue
+		}
+		email := accountEmailKey(accounts[importedIndex].Email)
+		if email == "" {
+			continue
+		}
+		for i := 0; i < len(accounts); i++ {
+			if i == importedIndex || accountEmailKey(accounts[i].Email) != email {
+				continue
+			}
+			if failed[originalToken] {
+				if !newTokens[originalToken] {
+					break
+				}
+				accounts = append(accounts[:importedIndex], accounts[importedIndex+1:]...)
+				merged++
+				break
+			}
+			previous := accounts[i]
+			current := accounts[importedIndex]
+			mergeAccount(&previous, current)
+			previous.AccessToken = current.AccessToken
+			previous.IsSignupToken = current.IsSignupToken
+			previous.Status = current.Status
+			previous.Type = current.Type
+			previous.SourceType = current.SourceType
+			previous.Quota = current.Quota
+			previous.ImageQuotaUnknown = current.ImageQuotaUnknown
+			accounts[importedIndex] = previous
+			accounts = append(accounts[:i], accounts[i+1:]...)
+			merged++
+			if i < importedIndex {
+				importedIndex--
+			}
+			i = -1
+		}
+	}
+	return accounts, merged
 }
 
 func accountFromRecord(token, source string, rec map[string]any) Account {
@@ -425,8 +506,9 @@ func mergeAccount(dst *Account, src Account) {
 
 func mergeRefreshedAccount(dst *Account, info Account) {
 	status := dst.Status
+	info.SourceType = ""
 	mergeAccount(dst, info)
-	if status == "异常" || status == "禁用" {
+	if status == "异常" || status == "禁用" || status == "封号" {
 		dst.Status = status
 	} else if status == "限流" {
 		if info.Status == "正常" && !info.ImageQuotaUnknown && info.Quota > 0 {
@@ -441,6 +523,11 @@ func mergeRefreshedAccount(dst *Account, info Account) {
 }
 
 func (s *Server) refreshAccountInfos(parent context.Context, tokens []string) (int, []map[string]any) {
+	refreshed, errs, _ := s.refreshAccountInfosWithFinalTokens(parent, tokens)
+	return refreshed, errs
+}
+
+func (s *Server) refreshAccountInfosWithFinalTokens(parent context.Context, tokens []string) (int, []map[string]any, map[string]string) {
 	want := map[string]bool{}
 	for _, t := range tokens {
 		if strings.TrimSpace(t) != "" {
@@ -455,7 +542,15 @@ func (s *Server) refreshAccountInfos(parent context.Context, tokens []string) (i
 		selected = append(selected, a)
 		delete(want, a.AccessToken)
 	}
-	results := runAccountRefreshBatch(parent, selected, s.refreshAccountInfo)
+	finalTokens := map[string]string{}
+	var finalTokensMu sync.Mutex
+	results := runAccountRefreshBatch(parent, selected, func(ctx context.Context, account Account) error {
+		return s.refreshAccountInfoWithFinalToken(ctx, account, func(token string) {
+			finalTokensMu.Lock()
+			finalTokens[account.AccessToken] = token
+			finalTokensMu.Unlock()
+		})
+	})
 	refreshed := 0
 	errs := []map[string]any{}
 	for token := range want {
@@ -468,7 +563,7 @@ func (s *Server) refreshAccountInfos(parent context.Context, tokens []string) (i
 			errs = append(errs, map[string]any{"token": selected[i].AccessToken, "error": err.Error()})
 		}
 	}
-	return refreshed, errs
+	return refreshed, errs, finalTokens
 }
 
 func runAccountRefreshBatch(parent context.Context, accounts []Account, refresh func(context.Context, Account) error) []error {
@@ -494,7 +589,14 @@ func runAccountRefreshBatchReport(parent context.Context, accounts []Account, re
 					}
 					continue
 				}
-				ctx, cancel := context.WithTimeout(parent, 45*time.Second)
+				timeout := 45 * time.Second
+				if ptrString(accounts[i].Password) != "" || ptrString(accounts[i].EmailPassword) != "" ||
+					strings.HasSuffix(strings.ToLower(ptrString(accounts[i].Email)), "@icloud.com") ||
+					(accounts[i].Mailbox != nil && (strAny(accounts[i].Mailbox["password"], "") != "" ||
+						strAny(accounts[i].Mailbox["refresh_token"], "") != "")) {
+					timeout = 180 * time.Second
+				}
+				ctx, cancel := context.WithTimeout(parent, timeout)
 				results[i] = refresh(ctx, accounts[i])
 				cancel()
 				if report != nil {
@@ -512,6 +614,13 @@ func runAccountRefreshBatchReport(parent context.Context, accounts []Account, re
 }
 
 func (s *Server) refreshAccountInfo(ctx context.Context, a Account) error {
+	return s.refreshAccountInfoWithFinalToken(ctx, a, nil)
+}
+
+func (s *Server) refreshAccountInfoWithFinalToken(ctx context.Context, a Account, onToken func(string)) error {
+	if onToken != nil {
+		defer func() { onToken(a.AccessToken) }()
+	}
 	release, err := s.acquireAccountRefreshSlot(ctx)
 	if err != nil {
 		return err
@@ -530,13 +639,14 @@ func (s *Server) refreshAccountInfo(ctx context.Context, a Account) error {
 		return err
 	}
 	info, err := client.GetUserInfo(ctx)
+	canRelogin := ptrString(a.Password) != "" || s.canReadAccountEmailCode(a)
 	if isInvalidTokenErrorText(err) && ptrString(a.RefreshToken) != "" {
-		if preflightErr != nil && !terminalOAuthRefreshError(preflightErr) {
+		if preflightErr != nil && !terminalOAuthRefreshError(preflightErr) && !canRelogin {
 			return fmt.Errorf("oauth refresh after account authentication failure: %w", preflightErr)
 		}
 		if preflightErr == nil {
 			refreshed, refreshErr := s.refreshOAuthAccount(ctx, a.AccessToken)
-			if refreshErr != nil && !terminalOAuthRefreshError(refreshErr) {
+			if refreshErr != nil && !terminalOAuthRefreshError(refreshErr) && !canRelogin {
 				return fmt.Errorf("oauth refresh after account authentication failure: %w", refreshErr)
 			}
 			if refreshErr == nil {
@@ -548,10 +658,35 @@ func (s *Server) refreshAccountInfo(ctx context.Context, a Account) error {
 			}
 		}
 	}
+	if isInvalidTokenErrorText(err) && canRelogin {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		oldToken := a.AccessToken
+		var relogged Account
+		var loginErr error
+		if ptrString(a.Password) != "" {
+			relogged, loginErr = s.reLoginAccountWithPasswordSecret(ctx, a, ptrString(a.MFASecret))
+		} else {
+			relogged, loginErr = s.reLoginAccountWithEmailCode(ctx, a)
+		}
+		if loginErr != nil {
+			s.markAccountRefreshAuthFailure(a, err)
+			return fmt.Errorf("令牌已过期，重新授权失败: %w", loginErr)
+		}
+		if persistErr := s.persistReLoginAccount(oldToken, relogged); persistErr != nil {
+			return persistErr
+		}
+		a = relogged
+		client, err = s.newUpstreamClientForAccount(a)
+		if err == nil {
+			info, err = client.GetUserInfo(ctx)
+		}
+	}
 	if err == nil {
 		return s.applyAccountInfoRefresh(a, info)
 	}
-	if isInvalidTokenErrorText(err) {
+	if isInvalidTokenErrorText(err) || isAccountDeactivatedError(err) {
 		s.markAccountRefreshAuthFailure(a, err)
 	}
 	return err

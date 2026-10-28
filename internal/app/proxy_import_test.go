@@ -62,6 +62,24 @@ func TestProxyNodeImportLimits(t *testing.T) {
 	}
 }
 
+func TestProxyNodeImportAcceptsMixedNodeFormats(t *testing.T) {
+	result, err := parseProxyNodeImport(proxyNodeImportRequest{Text: strings.Join([]string{
+		"http://127.0.0.1:7897",
+		"socks://proxy.example:35086:user:pass",
+		"socks5h://proxy.example:35087:user:pass",
+		"socks5://user:pass@proxy.example:35086",
+	}, "\n")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.AddedCount != 3 || result.DuplicateCount != 1 || result.InvalidCount != 0 {
+		t.Fatalf("unexpected import counts: added=%d duplicates=%d invalid=%d", result.AddedCount, result.DuplicateCount, result.InvalidCount)
+	}
+	if result.Nodes[1].URL != "socks5://user:pass@proxy.example:35086" || result.Nodes[2].URL != "socks5h://user:pass@proxy.example:35087" {
+		t.Fatal("SOCKS URLs were not normalized")
+	}
+}
+
 func TestHandleProxyNodeImportRequiresAdminAndDoesNotPersist(t *testing.T) {
 	s := &Server{cfg: Config{AuthKey: "test-key"}}
 	request := func(key string) *httptest.ResponseRecorder {

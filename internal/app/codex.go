@@ -11,7 +11,7 @@ import (
 	http "github.com/bogdanfinn/fhttp"
 )
 
-const codexResponsesModel = "gpt-5.5"
+const codexResponsesModel = "gpt-5.6-sol"
 const codexImageInstruction = "You are an image generation assistant."
 
 func isCodexImageRequest(model, resolution string) bool {
@@ -114,10 +114,12 @@ func (c *UpstreamClient) GenerateCodexImage(ctx context.Context, prompt, model, 
 	path := "/backend-api/codex/responses"
 	installationID := randID(16)
 	content := []map[string]any{{"type": "input_text", "text": prompt}}
+	action := "generate"
 	for _, img := range refs {
 		if len(img) == 0 {
 			continue
 		}
+		action = "edit"
 		content = append(content, map[string]any{
 			"type":      "input_image",
 			"image_url": "data:image/png;base64," + base64.StdEncoding.EncodeToString(img),
@@ -129,9 +131,12 @@ func (c *UpstreamClient) GenerateCodexImage(ctx context.Context, prompt, model, 
 		"input":        []map[string]any{{"role": "user", "content": content}},
 		"instructions": codexImageInstruction,
 		"tools": []map[string]any{{
-			"type":  "image_generation",
-			"model": imageGenerationModelForTool(model),
-			"size":  size,
+			"type":          "image_generation",
+			"model":         imageGenerationModelForTool(model),
+			"action":        action,
+			"size":          size,
+			"quality":       "auto",
+			"output_format": "png",
 		}},
 		"tool_choice":     map[string]any{"type": "image_generation"},
 		"stream":          true,
@@ -155,8 +160,7 @@ func (c *UpstreamClient) GenerateCodexImage(ctx context.Context, prompt, model, 
 		}
 		typ := strAny(event["type"], "")
 		if typ == "response.failed" || typ == "error" {
-			errObj, _ := event["error"].(map[string]any)
-			return nil, fmt.Errorf("codex image generation failed: %s", firstNonEmpty(strAny(errObj["message"], ""), strAny(event["message"], "")))
+			return nil, fmt.Errorf("codex image generation failed: %s", codexFailureMessage(event))
 		}
 		if typ == "response.output_item.done" {
 			if item, ok := event["item"].(map[string]any); ok && strAny(item["type"], "") == "image_generation_call" && strAny(item["result"], "") != "" {
@@ -198,6 +202,22 @@ func (c *UpstreamClient) GenerateCodexImage(ctx context.Context, prompt, model, 
 		return nil, errors.New("Codex image generation returned no image")
 	}
 	return results, nil
+}
+
+func codexFailureMessage(event map[string]any) string {
+	if errObj, ok := event["error"].(map[string]any); ok {
+		if message := strings.TrimSpace(strAny(errObj["message"], "")); message != "" {
+			return message
+		}
+	}
+	if response, ok := event["response"].(map[string]any); ok {
+		if errObj, ok := response["error"].(map[string]any); ok {
+			if message := strings.TrimSpace(strAny(errObj["message"], "")); message != "" {
+				return message
+			}
+		}
+	}
+	return firstNonEmpty(strAny(event["message"], ""), "upstream returned a failed response")
 }
 
 func imageGenerationModelForTool(model string) string {

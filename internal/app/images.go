@@ -3,6 +3,7 @@ package app
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"crypto/md5"
 	"encoding/json"
 	"fmt"
@@ -16,23 +17,50 @@ import (
 )
 
 func (s *Server) saveImage(r *http.Request, data []byte) (string, string, error) {
-	return s.saveImageWithBaseURL(s.baseURL(r), data)
+	return s.saveImageWithBaseURL(r.Context(), s.baseURL(r), data)
 }
 
-func (s *Server) saveImageWithBaseURL(baseURL string, data []byte) (string, string, error) {
+func (s *Server) saveImageWithBaseURL(ctx context.Context, baseURL string, data []byte) (string, string, error) {
 	s.maybeCleanupOldImages()
 	sum := md5.Sum(data)
 	relDir := filepath.Join(time.Now().Format("2006"), time.Now().Format("01"), time.Now().Format("02"))
 	name := fmt.Sprintf("%d_%x.png", time.Now().Unix(), sum)
 	rel := filepath.ToSlash(filepath.Join(relDir, name))
-	path := filepath.Join(s.imagesDir, relDir, name)
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+	settings := s.imageStorageSettings()
+	if settings.Mode == "local" || settings.Mode == "both" || settings.Mode == "r2_both" {
+		path := filepath.Join(s.imagesDir, relDir, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			return "", "", err
+		}
+		if err := os.WriteFile(path, data, 0644); err != nil {
+			return "", "", err
+		}
+	}
+	webdav := settings.Mode == "webdav" || settings.Mode == "both"
+	r2 := settings.Mode == "r2" || settings.Mode == "r2_both"
+	if webdav {
+		if err := settings.put(ctx, rel, data); err != nil {
+			return "", "", err
+		}
+	}
+	if r2 {
+		if err := settings.r2Put(ctx, rel, data); err != nil {
+			return "", "", err
+		}
+	}
+	entry := imageStorageEntry{Rel: rel, Size: int64(len(data)), CreatedAt: time.Now().Format(time.RFC3339), WebDAV: webdav, R2: r2}
+	if r2 {
+		entry.R2Key = settings.r2Key(rel)
+		if thumbnail, err := encodeImageThumbnail(data); err == nil {
+			if err := settings.r2Put(ctx, "thumbnails/"+rel+".jpg", thumbnail); err == nil {
+				entry.R2ThumbnailKey = settings.r2ThumbnailKey(rel)
+			}
+		}
+	}
+	if err := s.updateImageIndex(rel, &entry); err != nil {
 		return "", "", err
 	}
-	if err := os.WriteFile(path, data, 0644); err != nil {
-		return "", "", err
-	}
-	return rel, baseURL + "/images/" + rel, nil
+	return rel, s.imageURL(baseURL, rel), nil
 }
 func (s *Server) recordOwner(id *Identity, rel string) {
 	if id == nil {
@@ -157,32 +185,56 @@ func (s *Server) listImages(r *http.Request, ownerFilter string) map[string]any 
 	prompts := s.store.LoadPrompts()
 	tags := s.store.LoadTags()
 	items := []map[string]any{}
-	filepath.WalkDir(s.imagesDir, func(path string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
-			return nil
+	indexed := s.imageIndex()
+	seen := map[string]bool{}
+	appendItem := func(rel string, size int64, createdAt string, local bool, entry imageStorageEntry) {
+		owner := owners[rel]
+		if ownerFilter != "" && ((ownerFilter == "__unowned__" && owner != "") || (ownerFilter != "__unowned__" && owner != ownerFilter)) {
+			return
 		}
-		ext := strings.ToLower(filepath.Ext(path))
-		if ext != ".png" && ext != ".jpg" && ext != ".jpeg" && ext != ".webp" {
+		pr := prompts[rel]
+		items = append(items, map[string]any{"rel": rel, "path": rel, "name": filepath.Base(rel), "date": createdAt[:10], "size": size, "url": s.imageURLForEntry(s.baseURL(r), rel, entry), "thumbnail_url": s.imageThumbnailURLForEntry(s.baseURL(r), rel, entry), "created_at": createdAt, "tags": tags[rel], "owner_id": owner, "prompt": strAny(pr["prompt"], ""), "storage": imageStorageMode(local, entry)})
+	}
+	filepath.WalkDir(s.imagesDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !isImageFile(path) {
 			return nil
 		}
 		rel, _ := filepath.Rel(s.imagesDir, path)
 		rel = filepath.ToSlash(rel)
-		owner := owners[rel]
-		if ownerFilter != "" {
-			if ownerFilter == "__unowned__" && owner != "" {
-				return nil
-			}
-			if ownerFilter != "__unowned__" && owner != ownerFilter {
-				return nil
-			}
+		seen[rel] = true
+		st, err := d.Info()
+		if err == nil {
+			appendItem(rel, st.Size(), st.ModTime().Format(time.RFC3339), true, indexed[rel])
 		}
-		st, _ := d.Info()
-		pr := prompts[rel]
-		items = append(items, map[string]any{"rel": rel, "path": rel, "name": d.Name(), "date": st.ModTime().Format("2006-01-02"), "size": st.Size(), "url": s.baseURL(r) + "/images/" + rel, "thumbnail_url": s.baseURL(r) + "/image-thumbnails/" + rel, "created_at": st.ModTime().Format(time.RFC3339), "tags": tags[rel], "owner_id": owner, "prompt": strAny(pr["prompt"], "")})
 		return nil
 	})
+	for rel, entry := range indexed {
+		if !seen[rel] && (entry.WebDAV || entry.R2) && isImageFile(rel) {
+			createdAt := entry.CreatedAt
+			if len(createdAt) < 10 {
+				createdAt = time.Now().Format(time.RFC3339)
+			}
+			appendItem(rel, entry.Size, createdAt, false, entry)
+		}
+	}
 	sort.Slice(items, func(i, j int) bool { return strAny(items[i]["created_at"], "") > strAny(items[j]["created_at"], "") })
 	return map[string]any{"items": items}
+}
+
+func imageStorageMode(local bool, entry imageStorageEntry) string {
+	if local && entry.R2 {
+		return "r2_both"
+	}
+	if entry.R2 {
+		return "r2"
+	}
+	if local && entry.WebDAV {
+		return "both"
+	}
+	if entry.WebDAV {
+		return "webdav"
+	}
+	return "local"
 }
 func (s *Server) handleImages(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.requireAdmin(w, r); !ok {
@@ -243,9 +295,18 @@ func (s *Server) handleImageDelete(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			continue
 		}
-		if os.Remove(path) == nil {
+		_, localErr := os.Stat(path)
+		entry := s.imageIndex()[rel]
+		if os.IsNotExist(localErr) && !entry.WebDAV && !entry.R2 {
+			continue
+		}
+		if err := s.deleteStoredImage(r.Context(), rel); err == nil {
 			removed++
 			delete(owners, rel)
+		} else {
+			_ = s.store.SaveOwners(owners)
+			writeErr(w, http.StatusBadGateway, err.Error())
+			return
 		}
 	}
 	_ = s.store.SaveOwners(owners)
@@ -266,15 +327,16 @@ func (s *Server) handleImageDownload(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			continue
 		}
-		path, err := s.imagePath(rel)
+		data, err := s.readStoredImage(r.Context(), rel)
 		if err != nil {
+			if !os.IsNotExist(err) {
+				http.Error(w, "image storage unavailable", http.StatusBadGateway)
+				return
+			}
 			continue
 		}
-		data, err := os.ReadFile(path)
-		if err == nil {
-			f, _ := zw.Create(filepath.Base(rel))
-			_, _ = f.Write(data)
-		}
+		f, _ := zw.Create(filepath.Base(rel))
+		_, _ = f.Write(data)
 	}
 	_ = zw.Close()
 	w.Header().Set("Content-Type", "application/zip")
@@ -290,12 +352,17 @@ func (s *Server) handleImageDownloadSingle(w http.ResponseWriter, r *http.Reques
 		http.NotFound(w, r)
 		return
 	}
-	path, err := s.imagePath(rel)
+	data, err := s.readStoredImage(r.Context(), rel)
 	if err != nil {
-		http.NotFound(w, r)
+		if os.IsNotExist(err) {
+			http.NotFound(w, r)
+		} else {
+			http.Error(w, "image storage unavailable", http.StatusBadGateway)
+		}
 		return
 	}
-	http.ServeFile(w, r, path)
+	w.Header().Set("Content-Disposition", "attachment; filename="+filepath.Base(rel))
+	http.ServeContent(w, r, filepath.Base(rel), time.Time{}, bytes.NewReader(data))
 }
 func (s *Server) handleThumbnail(w http.ResponseWriter, r *http.Request) {
 	rel := strings.TrimPrefix(r.URL.Path, "/image-thumbnails/")

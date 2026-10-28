@@ -23,9 +23,11 @@ import {
   createImageGenerationTask,
   cancelImageTasks,
   fetchImageTasks,
+  fetchModels,
   fetchMyIdentity,
   publishGalleryItem,
   type ImageTask,
+  type ImageModel,
 } from "@/lib/api";
 import { useAuthGuard } from "@/lib/use-auth-guard";
 import {
@@ -48,7 +50,13 @@ const ACTIVE_CONVERSATION_STORAGE_KEY = "chatgpt2api:image_active_conversation_i
 const IMAGE_SIZE_STORAGE_KEY = "chatgpt2api:image_last_size";
 const IMAGE_RESOLUTION_STORAGE_KEY = "chatgpt2api:image_last_resolution";
 const IMAGE_COUNT_STORAGE_KEY = "chatgpt2api:image_last_count";
+const IMAGE_MODEL_STORAGE_KEY = "chatgpt2api:image_last_model";
 const HIGH_RESOLUTION_VALUES = new Set(["2k", "4k"]);
+const DEFAULT_IMAGE_MODELS: ImageModel[] = ["gpt-image-2", "gpt-image-2.5", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst"];
+const WEB_IMAGE_MODELS = new Set<string>(DEFAULT_IMAGE_MODELS);
+function isImageModel(value: string): value is ImageModel {
+  return WEB_IMAGE_MODELS.has(value) || value === "codex-gpt-image-2" || value.endsWith("-codex-gpt-image-2");
+}
 // 每个会话的滚动位置单独存。用 sessionStorage 因为这就是"会话级"的临时位置，
 // 关浏览器后从底部重看更自然；要跨浏览器会话保留改成 localStorage 即可。
 const SCROLL_POSITION_STORAGE_KEY = "chatgpt2api:image_scroll_positions";
@@ -177,6 +185,7 @@ function taskDataToStoredImage(image: StoredImage, task: ImageTask): StoredImage
       status: "success",
       b64_json: first.b64_json,
       url: first.url,
+      image_rel: first.image_rel,
       revised_prompt: first.revised_prompt,
       error: undefined,
     };
@@ -405,6 +414,8 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
   const [imageCount, setImageCount] = useState("1");
   const [imageSize, setImageSize] = useState("");
   const [imageResolution, setImageResolution] = useState("");
+  const [imageModel, setImageModel] = useState<ImageModel>("gpt-image-2");
+  const [imageModels, setImageModels] = useState<ImageModel[]>(DEFAULT_IMAGE_MODELS);
   const [promptLibraryOpen, setPromptLibraryOpen] = useState(false);
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
   const [referenceImageFiles, setReferenceImageFiles] = useState<File[]>([]);
@@ -494,6 +505,24 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
   useEffect(() => {
     conversationsRef.current = conversations;
   }, [conversations]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const storedModel = window.localStorage.getItem(IMAGE_MODEL_STORAGE_KEY);
+    if (storedModel && isImageModel(storedModel)) setImageModel(storedModel);
+    void fetchModels().then(({ data }) => {
+      if (cancelled) return;
+      const models = Array.from(new Set(data.map(({ id }) => id).filter(isImageModel)));
+      const options: ImageModel[] = Array.from(new Set([...DEFAULT_IMAGE_MODELS, ...models]));
+      setImageModels(options);
+      setImageModel((current) => options.includes(current) ? current : options[0]);
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    window.localStorage.setItem(IMAGE_MODEL_STORAGE_KEY, imageModel);
+  }, [imageModel]);
 
   // /works 页"用此图重画"会把 { rel, url, prompt } 写进 sessionStorage 然后跳过来。
   // 这里 mount 时读一次：拉图 → 转 File + dataUrl → 塞参考图区，prompt 直接灌输入框。
@@ -1116,12 +1145,10 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
 
   const publishStateOf = useCallback(
     (image: StoredImage): ImagePublishState => {
-      // 优先读已记录的状态；没有就按图本身能不能发判断：
-      //   - 有 url（http(s)）：可发，初始 idle
-      //   - 仅 b64_json：本地编辑产物 / 远端不可寻址，不能用 image_rel 主键 → unsupported
+      // 有图片引用或可解析的图片地址时可以发布。
       const recorded = publishStates.get(image.id);
       if (recorded) return recorded;
-      if (image.url && /^https?:\/\//i.test(image.url)) return "idle";
+      if (image.image_rel || image.url?.includes("/images/")) return "idle";
       return "unsupported";
     },
     [publishStates],
@@ -1149,7 +1176,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
       const turn = conversation?.turns.find((t) => t.id === turnId);
       if (!conversation || !turn) return;
 
-      const rel = extractImageRel(image.url);
+      const rel = image.image_rel || extractImageRel(image.url);
       if (!rel) {
         toast.error("当前图片无法发布到画廊");
         setPublishStates((prev) => {
@@ -1616,7 +1643,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     const draftTurn: ImageTurn = {
       id: turnId,
       prompt,
-      model: "gpt-image-2",
+      model: imageModel,
       mode: effectiveImageMode,
       referenceImages: effectiveImageMode === "edit" ? referenceImages : [],
       count: parsedCount,
@@ -1799,6 +1826,8 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
             <ImageComposer
               prompt={imagePrompt}
               imageCount={imageCount}
+              imageModel={imageModel}
+              imageModels={imageModels}
               imageSize={imageSize}
               imageResolution={imageResolution}
               canUseHighResolution={canUseHighResolution}
@@ -1824,6 +1853,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
               }}
               onPromptChange={setImagePrompt}
               onImageCountChange={(value) => setImageCount(value ? clampImageCount(value) : "")}
+              onImageModelChange={(model) => { if (isImageModel(model)) setImageModel(model); }}
               onImageSizeChange={setImageSize}
               onImageResolutionChange={setImageResolution}
               onSubmit={handleSubmit}

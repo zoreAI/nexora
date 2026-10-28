@@ -21,6 +21,65 @@ func TestMergeImportedTokenPreservesExistingAccountState(t *testing.T) {
 	}
 }
 
+func TestMergeImportedEmailsKeepsFreshTokenAndExistingCredentials(t *testing.T) {
+	oldEmail, newEmail := " User@Example.com ", "user@example.com"
+	password, secret := "login-password", "TOTPSECRET"
+	accounts := []Account{
+		{AccessToken: "old-token", Email: &oldEmail, Password: &password, MFASecret: &secret, MFAStatus: "enabled", GroupID: "group-1", Proxy: "direct", Status: "异常", Quota: 2, Success: 7},
+		{AccessToken: "new-token", Email: &newEmail, Status: "正常", Type: "plus", SourceType: "codex", Quota: 20},
+	}
+	result, merged := mergeImportedEmails(accounts, []string{"new-token"}, nil, map[string]bool{"new-token": true}, nil)
+	if merged != 1 || len(result) != 1 {
+		t.Fatalf("merged=%d accounts=%d, want one merged account", merged, len(result))
+	}
+	got := result[0]
+	if got.AccessToken != "new-token" || got.Status != "正常" || got.Type != "plus" || got.SourceType != "codex" || got.Quota != 20 {
+		t.Fatalf("fresh account data not kept: %+v", got)
+	}
+	if ptrString(got.Password) != password || ptrString(got.MFASecret) != secret || got.MFAStatus != "enabled" || got.GroupID != "group-1" || got.Proxy != "direct" || got.Success != 7 {
+		t.Fatalf("existing account data not kept: %+v", got)
+	}
+}
+
+func TestMergeImportedEmailsKeepsExistingAccountWhenNewTokenRefreshFails(t *testing.T) {
+	email := "user@example.com"
+	accounts := []Account{
+		{AccessToken: "old-token", Email: &email, Status: "正常"},
+		{AccessToken: "new-token", Email: &email, Status: "异常"},
+	}
+	result, merged := mergeImportedEmails(accounts, []string{"new-token"}, nil, map[string]bool{"new-token": true}, map[string]bool{"new-token": true})
+	if merged != 1 || len(result) != 1 || result[0].AccessToken != "old-token" || result[0].Status != "正常" {
+		t.Fatalf("failed import replaced existing account: merged=%d accounts=%+v", merged, result)
+	}
+}
+
+func TestMergeImportedEmailsDoesNotGuessEmailForTokenOnlyFailure(t *testing.T) {
+	email := "user@example.com"
+	accounts := []Account{{AccessToken: "old-token", Email: &email}, {AccessToken: "new-token"}}
+	result, merged := mergeImportedEmails(accounts, []string{"new-token"}, nil, map[string]bool{"new-token": true}, map[string]bool{"new-token": true})
+	if merged != 0 || len(result) != 2 {
+		t.Fatalf("unknown email should not be merged: merged=%d accounts=%+v", merged, result)
+	}
+}
+
+func TestMergeImportedEmailsUsesTokenAfterOAuthRefresh(t *testing.T) {
+	email := "user@example.com"
+	accounts := []Account{{AccessToken: "old-token", Email: &email}, {AccessToken: "rotated-token", Email: &email, Status: "正常"}}
+	result, merged := mergeImportedEmails(accounts, []string{"import-token"}, map[string]string{"import-token": "rotated-token"}, map[string]bool{"import-token": true}, nil)
+	if merged != 1 || len(result) != 1 || result[0].AccessToken != "rotated-token" {
+		t.Fatalf("rotated token not used for merge: merged=%d accounts=%+v", merged, result)
+	}
+}
+
+func TestRefreshPreservesImportedCodexSource(t *testing.T) {
+	account := accountFromRecord("access-token", "codex", map[string]any{"access_token": "access-token"})
+	info := Account{Type: "Plus", SourceType: "web", Status: "正常", Quota: 120}
+	mergeRefreshedAccount(&account, info)
+	if account.SourceType != "codex" || account.Type != "Plus" || account.Quota != 120 {
+		t.Fatalf("refreshed account source/type/quota = %q/%q/%d", account.SourceType, account.Type, account.Quota)
+	}
+}
+
 func TestAccountFromRecordPreservesPythonExportFields(t *testing.T) {
 	account := accountFromRecord("access-token", "import", map[string]any{
 		"type":          "codex",

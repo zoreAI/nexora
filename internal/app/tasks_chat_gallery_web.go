@@ -354,14 +354,14 @@ func (s *Server) saveImageTaskResults(ctx context.Context, baseURL, prompt strin
 		if err := ctx.Err(); err != nil {
 			return data, rels, err
 		}
-		rel, url, err := s.saveImageWithBaseURL(baseURL, result.Bytes)
+		rel, _, err := s.saveImageWithBaseURL(ctx, baseURL, result.Bytes)
 		if err != nil {
 			return data, rels, err
 		}
 		rels = append(rels, rel)
 		data = append(data, map[string]any{
-			"url":            url,
-			"b64_json":       base64.StdEncoding.EncodeToString(result.Bytes),
+			"image_rel":      rel,
+			"url":            "/images/" + rel,
 			"revised_prompt": firstNonEmpty(result.RevisedPrompt, prompt),
 		})
 	}
@@ -758,7 +758,9 @@ func (s *Server) handleImageTaskEdit(w http.ResponseWriter, r *http.Request) {
 		}
 		runCtx, stop := context.WithTimeout(ctx, s.imageRequestTimeout())
 		defer stop()
+		generationStart := time.Now()
 		items, err := s.generateImageWithPool(runCtx, prompt, model, task.Size, task.Resolution, inputs)
+		generationMS := time.Since(generationStart).Milliseconds()
 		if err == nil && len(items) == 0 {
 			err = errors.New("image generation returned no images")
 		}
@@ -779,7 +781,9 @@ func (s *Server) handleImageTaskEdit(w http.ResponseWriter, r *http.Request) {
 		}
 		_, _ = s.updateTaskProgress(task.OwnerID, task.ID, "saving", "保存图片")
 		res := items[0]
-		rel, url, err := s.saveImageWithBaseURL(baseURL, res.Bytes)
+		saveStart := time.Now()
+		rel, _, err := s.saveImageWithBaseURL(runCtx, baseURL, res.Bytes)
+		saveMS := time.Since(saveStart).Milliseconds()
 		if err != nil {
 			settle("error", err.Error(), nil)
 			s.logCallFailure(callID, "/api/image-tasks/edits", model, "图生图任务", err, map[string]any{"task_id": task.ID})
@@ -790,13 +794,13 @@ func (s *Server) handleImageTaskEdit(w http.ResponseWriter, r *http.Request) {
 			s.logCallFailure(callID, "/api/image-tasks/edits", model, "图生图任务", errors.New("canceled"), map[string]any{"task_id": task.ID})
 			return
 		}
-		data := []map[string]any{{"url": url, "b64_json": base64.StdEncoding.EncodeToString(res.Bytes), "revised_prompt": firstNonEmpty(res.RevisedPrompt, prompt)}}
+		data := []map[string]any{{"image_rel": rel, "url": "/images/" + rel, "revised_prompt": firstNonEmpty(res.RevisedPrompt, prompt)}}
 		if updated, err := settle("success", "", data); err != nil {
 			s.logCallFailure(callID, "/api/image-tasks/edits", model, "图生图任务", err, map[string]any{"task_id": task.ID})
 		} else if updated {
 			s.recordOwner(identity, rel)
 			s.recordPrompt(rel, prompt, true)
-			s.logCallSuccess(callID, "/api/image-tasks/edits", model, "图生图任务", map[string]any{"task_id": task.ID, "image_count": len(data)})
+			s.logCallSuccess(callID, "/api/image-tasks/edits", model, "图生图任务", map[string]any{"task_id": task.ID, "image_count": len(data), "generation_ms": generationMS, "save_ms": saveMS})
 		} else {
 			s.logCallFailure(callID, "/api/image-tasks/edits", model, "图生图任务", errors.New("task result discarded after cancellation"), map[string]any{"task_id": task.ID})
 		}
@@ -1259,7 +1263,7 @@ func (s *Server) handleChatConversationID(w http.ResponseWriter, r *http.Request
 }
 
 func (s *Server) publicGalleryItem(r *http.Request, it GalleryItem) map[string]any {
-	return map[string]any{"id": it.ID, "image_rel": it.ImageRel, "image_url": s.baseURL(r) + "/images/" + it.ImageRel, "url": s.baseURL(r) + "/images/" + it.ImageRel, "publisher_name": it.PublisherName, "prompt": it.Prompt, "model": it.Model, "size": it.Size, "width": it.Width, "height": it.Height, "is_edit": it.IsEdit, "created_at": it.CreatedAt, "status": it.Status}
+	return map[string]any{"id": it.ID, "image_rel": it.ImageRel, "image_url": s.imageURL(s.baseURL(r), it.ImageRel), "url": s.imageURL(s.baseURL(r), it.ImageRel), "publisher_name": it.PublisherName, "prompt": it.Prompt, "model": it.Model, "size": it.Size, "width": it.Width, "height": it.Height, "is_edit": it.IsEdit, "created_at": it.CreatedAt, "status": it.Status}
 }
 func (s *Server) handleGalleryFeed(w http.ResponseWriter, r *http.Request) {
 	items := s.store.LoadGallery()
@@ -1281,6 +1285,9 @@ func (s *Server) handleGalleryPublish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rel := relClean(strAny(b["image_rel"], strAny(b["path"], strAny(b["url"], ""))))
+	if prefix := s.imageStorageSettings().PublicBaseURL; prefix != "" {
+		rel = strings.TrimPrefix(rel, prefix+"/")
+	}
 	rel = relFromURL(rel)
 	var err error
 	rel, err = safeImageRel(rel)

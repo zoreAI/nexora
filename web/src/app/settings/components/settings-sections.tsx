@@ -7,8 +7,9 @@ import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
-import { deleteProxyGroup, fetchProxyGroups, fetchProxyView, saveProxyDefaults, saveProxyGroup, testProxy, testProxyGroup, type ProxyGroup, type ProxyTestResult } from "@/lib/api";
+import { deleteProxyGroup, fetchProxyGroups, fetchProxyView, saveProxyDefaults, saveProxyGroup, syncImageStorage, testImageStorage, testProxy, testProxyGroup, type ProxyGroup, type ProxyTestResult } from "@/lib/api";
 
 import { useSettingsStore } from "../store";
 import { ProxyNodeImportDialog } from "./proxy-node-import-dialog";
@@ -362,6 +363,7 @@ export function NetworkSection() {
             <option value="round_robin">轮询</option><option value="request_random">每请求随机</option><option value="time_window">时间窗口</option>
           </select>
           <Textarea value={nodeURLs} onChange={(event) => setNodeURLs(event.target.value)} placeholder={'每行一个代理 URL\nhttp://127.0.0.1:7890\nsocks5h://127.0.0.1:1080'} className="min-h-24 rounded-xl border-stone-200 bg-white font-mono text-xs md:col-span-2" />
+          <p className="text-xs text-muted-foreground md:col-span-2">SOCKS 节点支持 socks://host:port:user:pass、socks5h://host:port:user:pass，也支持标准的 socks5://user:pass@host:port。</p>
         </div>
         <div className="flex justify-end"><ProxyNodeImportDialog existingURLs={parsedNodeURLs} onApply={applyImportedNodes} /></div>
         {parsedNodeURLs.length > 0 ? (
@@ -396,7 +398,10 @@ export function NetworkSection() {
 /* ───────────────────────── 图片 ───────────────────────── */
 
 export function ImageSection() {
+  const [isTestingStorage, setIsTestingStorage] = useState(false);
+  const [isSyncingStorage, setIsSyncingStorage] = useState(false);
   const config = useSettingsStore((s) => s.config);
+  const saveConfig = useSettingsStore((s) => s.saveConfig);
   const setBaseUrl = useSettingsStore((s) => s.setBaseUrl);
   const setImageRetentionDays = useSettingsStore((s) => s.setImageRetentionDays);
   const setCleanupProtectGallery = useSettingsStore((s) => s.setCleanupProtectGallery);
@@ -405,6 +410,36 @@ export function ImageSection() {
   const setImagePollIntervalSecs = useSettingsStore((s) => s.setImagePollIntervalSecs);
   const setImagePollInitialWaitSecs = useSettingsStore((s) => s.setImagePollInitialWaitSecs);
   const setImageAccountConcurrency = useSettingsStore((s) => s.setImageAccountConcurrency);
+  const setImageStorageField = useSettingsStore((s) => s.setImageStorageField);
+
+  const handleTestStorage = async () => {
+    if (!config?.image_storage) return;
+    setIsTestingStorage(true);
+    try {
+      const { result } = await testImageStorage(config.image_storage);
+      if (!result.ok) throw new Error(result.error || "连接失败");
+      toast.success("存储连接正常");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "连接失败");
+    } finally {
+      setIsTestingStorage(false);
+    }
+  };
+
+  const r2Selected = config?.image_storage?.mode === "r2" || config?.image_storage?.mode === "r2_both";
+
+  const handleSyncStorage = async () => {
+    setIsSyncingStorage(true);
+    try {
+      if (!await saveConfig()) return;
+      const { result } = await syncImageStorage();
+      toast.success(`同步完成：原图上传 ${result.uploaded}，缩略图上传 ${result.thumbnails_uploaded || 0}，失败 ${result.failed + (result.thumbnails_failed || 0)}`);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "同步失败");
+    } finally {
+      setIsSyncingStorage(false);
+    }
+  };
 
   return (
     <div className="space-y-6">
@@ -417,6 +452,69 @@ export function ImageSection() {
           className={INPUT_CLASS}
         />
         <p className={HELP_CLASS}>用作生成结果 URL 的前缀。留空则按请求 host 自动推断。</p>
+      </div>
+
+      <div className="space-y-4 border-t border-stone-200 pt-5">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <label className="flex items-center gap-3 text-sm font-medium text-stone-800">
+            <Checkbox checked={Boolean(config?.image_storage?.enabled)} onCheckedChange={(checked) => setImageStorageField("enabled", Boolean(checked))} />
+            生图对象存储
+          </label>
+          <div className="flex gap-2">
+            <Button variant="outline" size="sm" disabled={!(r2Selected ? config?.image_storage?.r2_endpoint : config?.image_storage?.webdav_url) || isTestingStorage} onClick={() => void handleTestStorage()}>
+              {isTestingStorage ? <LoaderCircle className="size-4 animate-spin" /> : <PlugZap className="size-4" />}
+              测试连接
+            </Button>
+            <Button variant="outline" size="sm" disabled={!config?.image_storage?.enabled || config.image_storage.mode === "local" || isSyncingStorage} onClick={() => void handleSyncStorage()}>
+              {isSyncingStorage ? <LoaderCircle className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
+              同步历史图片
+            </Button>
+          </div>
+        </div>
+        <div className="grid gap-4 md:grid-cols-2">
+          <div className="space-y-2">
+            <label className={LABEL_CLASS}>保存模式</label>
+            <Select value={config?.image_storage?.mode || "local"} onValueChange={(value) => setImageStorageField("mode", value)} disabled={!config?.image_storage?.enabled}>
+              <SelectTrigger className={INPUT_CLASS}><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="local">仅本机</SelectItem>
+                <SelectItem value="webdav">仅 WebDAV</SelectItem>
+                <SelectItem value="both">本机 + WebDAV</SelectItem>
+                <SelectItem value="r2">仅 Cloudflare R2</SelectItem>
+                <SelectItem value="r2_both">本机 + Cloudflare R2</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+          {!r2Selected && <><div className="space-y-2">
+            <label className={LABEL_CLASS}>WebDAV URL</label>
+            <Input value={config?.image_storage?.webdav_url || ""} onChange={(event) => setImageStorageField("webdav_url", event.target.value)} placeholder="https://example.com/dav" className={INPUT_CLASS} />
+          </div>
+          <div className="space-y-2">
+            <label className={LABEL_CLASS}>用户名</label>
+            <Input value={config?.image_storage?.webdav_username || ""} onChange={(event) => setImageStorageField("webdav_username", event.target.value)} className={INPUT_CLASS} />
+          </div>
+          <div className="space-y-2">
+            <label className={LABEL_CLASS}>密码</label>
+            <Input type="password" value={config?.image_storage?.webdav_password || ""} onChange={(event) => setImageStorageField("webdav_password", event.target.value)} className={INPUT_CLASS} />
+          </div>
+          <div className="space-y-2">
+            <label className={LABEL_CLASS}>远端目录</label>
+            <Input value={config?.image_storage?.webdav_root_path || ""} onChange={(event) => setImageStorageField("webdav_root_path", event.target.value)} placeholder="chatgpt2api/images" className={INPUT_CLASS} />
+          </div>
+          <div className="space-y-2">
+            <label className={LABEL_CLASS}>公开访问前缀</label>
+            <Input value={config?.image_storage?.public_base_url || ""} onChange={(event) => setImageStorageField("public_base_url", event.target.value)} placeholder="https://cdn.example.com/images" className={INPUT_CLASS} />
+            <p className={HELP_CLASS}>留空时使用本应用的 /images/ 地址。</p>
+          </div></>}
+          {r2Selected && <>
+            <div className="space-y-2"><label className={LABEL_CLASS}>R2 S3 Endpoint</label><Input value={config?.image_storage?.r2_endpoint || ""} onChange={(event) => setImageStorageField("r2_endpoint", event.target.value)} placeholder="https://ACCOUNT_ID.r2.cloudflarestorage.com" className={INPUT_CLASS} /></div>
+            <div className="space-y-2"><label className={LABEL_CLASS}>Bucket</label><Input value={config?.image_storage?.r2_bucket || ""} onChange={(event) => setImageStorageField("r2_bucket", event.target.value)} className={INPUT_CLASS} /></div>
+            <div className="space-y-2"><label className={LABEL_CLASS}>Access Key ID</label><Input value={config?.image_storage?.r2_access_key_id || ""} onChange={(event) => setImageStorageField("r2_access_key_id", event.target.value)} className={INPUT_CLASS} /></div>
+            <div className="space-y-2"><label className={LABEL_CLASS}>Secret Access Key</label><Input type="password" value={config?.image_storage?.r2_secret_access_key || ""} onChange={(event) => setImageStorageField("r2_secret_access_key", event.target.value)} className={INPUT_CLASS} /></div>
+            <div className="space-y-2"><label className={LABEL_CLASS}>对象前缀</label><Input value={config?.image_storage?.r2_prefix || ""} onChange={(event) => setImageStorageField("r2_prefix", event.target.value)} placeholder="images" className={INPUT_CLASS} /></div>
+            <div className="space-y-2"><label className={LABEL_CLASS}>R2 公开访问前缀</label><Input value={config?.image_storage?.r2_public_url || ""} onChange={(event) => setImageStorageField("r2_public_url", event.target.value)} placeholder="https://cdn.example.com" className={INPUT_CLASS} /><p className={HELP_CLASS}>留空时由本应用读取私有 Bucket；公开地址需要已绑定的域名。</p></div>
+          </>}
+        </div>
       </div>
 
       <div className="grid gap-4 md:grid-cols-2">

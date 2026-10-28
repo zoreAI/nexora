@@ -127,6 +127,12 @@ func openStore(dir, backend, databaseURL string) (*Store, error) {
 	if err == nil {
 		err = s.migrateLogColumns()
 	}
+	if err == nil {
+		err = s.mergeLegacyCallLogs()
+	}
+	if err == nil {
+		err = s.migrateImageTaskBase64()
+	}
 	if err != nil {
 		s.db.Close()
 		return nil, fmt.Errorf("open %s storage: %w", backend, err)
@@ -356,6 +362,18 @@ func writeJSONFile(path string, value any) error {
 		return err
 	}
 	return os.Rename(tmp, path)
+}
+
+func (s *Store) LoadImageIndex() map[string]imageStorageEntry {
+	items := readJSONFile(s.path("image_index.json"), map[string]imageStorageEntry{})
+	if items == nil {
+		return map[string]imageStorageEntry{}
+	}
+	return items
+}
+
+func (s *Store) SaveImageIndex(items map[string]imageStorageEntry) error {
+	return writeJSONFile(s.path("image_index.json"), items)
 }
 
 func (s *Store) LoadAccounts() []Account {

@@ -15,6 +15,7 @@ import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import {
   fetchChatAccountTypes,
+  fetchModels,
   streamChat,
   type ChatAccountType,
   type ChatPersistedMessage,
@@ -48,6 +49,11 @@ type ChatUpload = {
 };
 
 const CHAT_ACCOUNT_TYPE_AUTO = "__auto__";
+const CHAT_MODEL_STORAGE_KEY = "chatgpt2api:chat_last_model";
+const CHAT_IMAGE_SIZES = ["1:1", "16:9", "4:3", "3:4", "9:16"];
+const CHAT_IMAGE_RESOLUTIONS = ["1k", "2k", "4k"];
+const isImageModel = (model: string) =>
+  ["gpt-image-2", "gpt-image-2.5", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst", "codex-gpt-image-2"].includes(model) || model.endsWith("-codex-gpt-image-2");
 const CHAT_ACCOUNT_TYPE_LABELS: Record<string, string> = {
   free: "Free",
   Plus: "Plus",
@@ -336,6 +342,10 @@ function ChatPageContent() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [uploads, setUploads] = useState<ChatUpload[]>([]);
+  const [selectedModel, setSelectedModel] = useState("auto");
+  const [availableModels, setAvailableModels] = useState<string[]>(["auto", "gpt-image-2", "gpt-image-2.5", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst"]);
+  const [imageSize, setImageSize] = useState("");
+  const [imageResolution, setImageResolution] = useState("");
   const [isStreaming, setIsStreaming] = useState(false);
   const [conversationId, setConversationId] = useState<string>("");
   const [activeId, setActiveId] = useState<string>("");
@@ -348,6 +358,7 @@ function ChatPageContent() {
   const abortRef = useRef<AbortController | null>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const shouldStickToBottomRef = useRef(true);
   const streamFrameRef = useRef<number | null>(null);
   const streamBufferRef = useRef("");
@@ -360,6 +371,23 @@ function ChatPageContent() {
       toast.error(message);
     });
   }, [loadConversations]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const storedModel = window.localStorage.getItem(CHAT_MODEL_STORAGE_KEY);
+    if (storedModel) setSelectedModel(storedModel);
+    void fetchModels().then(({ data }) => {
+      if (cancelled) return;
+      const models = Array.from(new Set([...availableModels, ...data.map(({ id }) => id).filter(Boolean)]));
+      setAvailableModels(models);
+      setSelectedModel((current) => models.includes(current) ? current : "auto");
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    window.localStorage.setItem(CHAT_MODEL_STORAGE_KEY, selectedModel);
+  }, [selectedModel]);
 
   useEffect(() => {
     let cancelled = false;
@@ -573,9 +601,10 @@ function ChatPageContent() {
     const attachedUploads = uploads;
     if ((!prompt && attachedUploads.length === 0) || isStreaming) return;
 
-    const isImagePrompt = isLikelyImagePrompt(prompt);
+    const isImagePrompt = isImageModel(selectedModel) || (selectedModel === "auto" && isLikelyImagePrompt(prompt));
+    const requestPrompt = prompt || (isImagePrompt ? "请基于参考图生成图片。" : "请分析这些附件。");
     const attachmentText = attachedUploads.length > 0 ? `\n\n${attachedUploads.map((item) => `[附件: ${item.name}]`).join("\n")}` : "";
-    const userMessage: ChatMessage = { id: createId(), role: "user", content: `${prompt || "请分析这些附件。"}${attachmentText}`, status: "idle" };
+    const userMessage: ChatMessage = { id: createId(), role: "user", content: `${requestPrompt}${attachmentText}`, status: "idle" };
     const assistantMessage: ChatMessage = {
       id: createId(),
       role: "assistant",
@@ -594,10 +623,12 @@ function ChatPageContent() {
 
     const currentContent: ChatStreamMessage["content"] = attachedUploads.length > 0
       ? [
-          { type: "text", text: prompt || "请分析这些附件。" },
-          ...attachedUploads.map((item) => ({ type: "input_file", file_name: item.name, file_data: item.dataUrl })),
+          { type: "text", text: requestPrompt },
+          ...attachedUploads.map((item) => isImagePrompt
+            ? { type: "input_image", image_url: item.dataUrl }
+            : { type: "input_file", file_name: item.name, file_data: item.dataUrl }),
         ]
-      : prompt;
+      : requestPrompt;
     const apiMessages: ChatStreamMessage[] = [
       ...baseHistory
         .filter((m) => m.status !== "error" && m.content.trim())
@@ -614,7 +645,7 @@ function ChatPageContent() {
 
     const initialPersisted: ChatPersistedMessage[] = [
       ...toPersistedMessages(baseHistory),
-      { role: "user", content: prompt },
+      { role: "user", content: requestPrompt },
     ];
     let streamCid = conversationId;
     let savedConversationId = activeId;
@@ -638,8 +669,10 @@ function ChatPageContent() {
     try {
       for await (const event of streamChat(
         {
-          model: isImagePrompt ? "gpt-image-2" : "auto",
+          model: selectedModel === "auto" && isImagePrompt ? "gpt-image-2" : selectedModel,
           messages: apiMessages,
+          size: isImagePrompt ? imageSize || undefined : undefined,
+          resolution: isImagePrompt ? imageResolution || undefined : undefined,
           conversation_id: conversationId || undefined,
           force_switch_account: switchAccount || undefined,
           account_type: requestedAccountType,
@@ -710,11 +743,12 @@ function ChatPageContent() {
       toast.error(message);
       return;
     }
+    setUploads([]);
 
     // done 之后一次性整条覆盖保存：包含完整历史 + upstream cid，给后端做 token 回填。
     const persisted: ChatPersistedMessage[] = [
       ...toPersistedMessages(baseHistory),
-      { role: "user", content: prompt },
+      { role: "user", content: requestPrompt },
       { role: "assistant", content: assistantContent },
     ];
     try {
@@ -740,6 +774,10 @@ function ChatPageContent() {
     queueStreamDelta,
     saveConversation,
     selectedAccountType,
+    selectedModel,
+    imageSize,
+    imageResolution,
+    uploads,
     waitForStreamDrain,
   ]);
 
@@ -927,6 +965,34 @@ function ChatPageContent() {
         </div>
 
         <div className="shrink-0 rounded-xl border border-border/60 bg-background p-2 shadow-sm">
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*"
+            multiple
+            className="hidden"
+            onChange={(event) => {
+              handleFileInput(event.target.files);
+              event.target.value = "";
+            }}
+          />
+          {uploads.length > 0 ? (
+            <div className="flex gap-2 overflow-x-auto px-2 pb-2">
+              {uploads.map((upload) => (
+                <div key={upload.id} className="relative size-14 shrink-0 overflow-hidden rounded-md border border-border">
+                  <img src={upload.dataUrl} alt={upload.name} className="size-full object-cover" />
+                  <button
+                    type="button"
+                    aria-label={`移除 ${upload.name}`}
+                    onClick={() => setUploads((current) => current.filter((item) => item.id !== upload.id))}
+                    className="absolute right-0 top-0 rounded-bl bg-background/90 p-0.5"
+                  >
+                    <X className="size-3.5" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          ) : null}
           <textarea
             ref={textareaRef}
             value={input}
@@ -936,25 +1002,44 @@ function ChatPageContent() {
             rows={1}
             className="hide-scrollbar w-full resize-none bg-transparent px-2 py-2 text-[14px] leading-6 text-foreground placeholder:text-muted-foreground/70 focus:outline-none"
           />
-          <div className="flex items-center justify-between gap-2 pt-1">
-            <Select
-              value={selectedAccountType}
-              onValueChange={setSelectedAccountType}
-              disabled={isStreaming || accountTypes.length === 0}
-            >
-              <SelectTrigger className="h-9 w-[116px] shrink-0 rounded-lg border-border bg-background px-3 text-[12px] shadow-none">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value={CHAT_ACCOUNT_TYPE_AUTO}>自动</SelectItem>
-                {accountTypes.map((type) => (
-                  <SelectItem key={type} value={type}>
-                    {formatChatAccountType(type)}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <div className="flex items-center justify-end gap-2">
+          <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+            <div className="flex min-w-0 flex-1 items-center gap-2 overflow-x-auto pb-0.5">
+              <Button variant="outline" size="icon" className="size-9 shrink-0 rounded-lg" title="添加参考图" aria-label="添加参考图" disabled={isStreaming || uploads.length >= 5} onClick={() => fileInputRef.current?.click()}>
+                <Paperclip className="size-4" />
+              </Button>
+              <Select value={selectedModel} onValueChange={setSelectedModel} disabled={isStreaming}>
+                <SelectTrigger aria-label="模型" className="h-9 w-[170px] shrink-0 rounded-lg border-border bg-background px-3 text-[12px] shadow-none"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  {availableModels.map((model) => <SelectItem key={model} value={model}>{model === "auto" ? "自动模型" : model}</SelectItem>)}
+                </SelectContent>
+              </Select>
+              <Select value={selectedAccountType} onValueChange={setSelectedAccountType} disabled={isStreaming || accountTypes.length === 0}>
+                <SelectTrigger aria-label="账号类型" className="h-9 w-[116px] shrink-0 rounded-lg border-border bg-background px-3 text-[12px] shadow-none"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={CHAT_ACCOUNT_TYPE_AUTO}>自动账号</SelectItem>
+                  {accountTypes.map((type) => <SelectItem key={type} value={type}>{formatChatAccountType(type)}</SelectItem>)}
+                </SelectContent>
+              </Select>
+              {isImageModel(selectedModel) || (selectedModel === "auto" && isLikelyImagePrompt(input)) ? (
+                <>
+                  <Select value={imageSize || "automatic"} onValueChange={(value) => setImageSize(value === "automatic" ? "" : value)} disabled={isStreaming}>
+                    <SelectTrigger aria-label="画面比例" className="h-9 w-[104px] shrink-0 rounded-lg border-border bg-background px-2 text-[12px] shadow-none"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="automatic">比例自动</SelectItem>
+                      {CHAT_IMAGE_SIZES.map((size) => <SelectItem key={size} value={size}>{size}</SelectItem>)}
+                    </SelectContent>
+                  </Select>
+                  <Select value={imageResolution || "automatic"} onValueChange={(value) => setImageResolution(value === "automatic" ? "" : value)} disabled={isStreaming}>
+                    <SelectTrigger aria-label="清晰度" className="h-9 w-[104px] shrink-0 rounded-lg border-border bg-background px-2 text-[12px] shadow-none"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="automatic">清晰度自动</SelectItem>
+                      {CHAT_IMAGE_RESOLUTIONS.map((resolution) => <SelectItem key={resolution} value={resolution}>{resolution.toUpperCase()}</SelectItem>)}
+                    </SelectContent>
+                  </Select>
+                </>
+              ) : null}
+            </div>
+            <div className="flex shrink-0 items-center justify-end gap-2">
               {conversationId && !isStreaming ? (
                 <Button
                   variant="outline"
@@ -979,7 +1064,7 @@ function ChatPageContent() {
                 <Button
                   className="h-9 cursor-pointer rounded-lg bg-foreground px-3 text-background hover:bg-foreground/90"
                   onClick={() => void handleSubmit()}
-                  disabled={!input.trim()}
+                  disabled={!input.trim() && uploads.length === 0}
                 >
                   <Send className="size-4" />
                   <span className="text-[13px]">发送</span>

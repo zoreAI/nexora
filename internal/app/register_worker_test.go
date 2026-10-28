@@ -461,6 +461,25 @@ func TestNormalizeRegisterConfigKeepsProxyDefaultWhenMissing(t *testing.T) {
 	}
 }
 
+func TestRegisterProxyGroupRotatesBetweenTasks(t *testing.T) {
+	store := NewStore(filepath.Join(t.TempDir(), "data"))
+	defer store.Close()
+	group, err := store.SaveProxyGroup(proxyGroupInput{Name: "register", Strategy: "round_robin", Nodes: []proxyNodeInput{
+		{URL: "http://127.0.0.1:7891"},
+		{URL: "http://127.0.0.1:7892"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := &registerService{server: &Server{store: store}}
+	for i, want := range []string{group.Nodes[0].URL, group.Nodes[1].URL, group.Nodes[0].URL} {
+		route, err := svc.resolveRegisterProxy("group:" + group.ID)
+		if err != nil || route.URL != want || route.NodeID == "" {
+			t.Fatalf("selection %d: route = %+v, err = %v, want URL %q", i, route, err, want)
+		}
+	}
+}
+
 func TestMessageBeforeCodeBoundary(t *testing.T) {
 	mailbox := &registerMailbox{CodeNotBefore: time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC)}
 	oldMessage := map[string]any{"received_at": "2026-07-16T11:59:40Z"}

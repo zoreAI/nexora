@@ -3,13 +3,14 @@ import webConfig from "@/constants/common-env";
 import { getStoredAuthKey } from "@/store/auth";
 
 export type AccountType = string;
-export type AccountStatus = "正常" | "限流" | "异常" | "禁用";
+export type AccountStatus = "正常" | "限流" | "异常" | "封号" | "禁用";
 export type ImageModel =
   | "gpt-image-2"
   | "gpt-image-2.5"
   | "gpt-image-2.5-flare"
   | "gpt-image-2.5-sunburst"
-  | "codex-gpt-image-2";
+  | "codex-gpt-image-2"
+  | `${string}-codex-gpt-image-2`;
 
 export type PromptLibraryItem = {
   id: string;
@@ -142,10 +143,20 @@ type AccountListResponse = {
   items: Account[];
 };
 
+export type Model = {
+  id: string;
+};
+
+export type ModelListResponse = {
+  object: "list";
+  data: Model[];
+};
+
 type AccountMutationResponse = {
   items: Account[];
   added?: number;
   skipped?: number;
+  merged?: number;
   removed?: number;
   refreshed?: number;
   signup_tokens?: number;
@@ -193,12 +204,29 @@ export type SettingsConfig = {
   image_poll_interval_secs?: number | string;
   image_poll_initial_wait_secs?: number | string;
   image_account_concurrency?: number | string;
+  image_storage?: ImageStorageSettings;
   auto_remove_invalid_accounts?: boolean;
   auto_remove_rate_limited_accounts?: boolean;
   log_levels?: string[];
   backup?: BackupSettings;
   backup_state?: BackupState;
   [key: string]: unknown;
+};
+
+export type ImageStorageSettings = {
+  enabled: boolean;
+  mode: "local" | "webdav" | "both" | "r2" | "r2_both";
+  webdav_url: string;
+  webdav_username: string;
+  webdav_password: string;
+  webdav_root_path: string;
+  public_base_url: string;
+  r2_endpoint: string;
+  r2_bucket: string;
+  r2_access_key_id: string;
+  r2_secret_access_key: string;
+  r2_prefix: string;
+  r2_public_url: string;
 };
 
 export type BackupInclude = {
@@ -347,7 +375,7 @@ export type ImageTask = {
   elapsed_ms?: number;
   created_at: string;
   updated_at: string;
-  data?: Array<{ b64_json?: string; url?: string; revised_prompt?: string }>;
+  data?: Array<{ b64_json?: string; url?: string; image_rel?: string; revised_prompt?: string }>;
   error?: string;
 };
 
@@ -507,8 +535,19 @@ export async function fetchAccounts() {
   return httpRequest<AccountListResponse>("/api/accounts");
 }
 
+export async function fetchModels() {
+  return httpRequest<ModelListResponse>("/v1/models");
+}
+
 export async function fetchAccountMFACode(accessToken: string) {
   return httpRequest<{ code: string; expires_in: number }>("/api/accounts/mfa/code", {
+    method: "POST",
+    body: { access_token: accessToken },
+  });
+}
+
+export async function loginAbnormalAccountWithMFA(accessToken: string) {
+  return httpRequest<{ ok: boolean }>("/api/accounts/mfa/login", {
     method: "POST",
     body: { access_token: accessToken },
   });
@@ -544,6 +583,17 @@ export async function startAccountRefresh(accessTokens: string[]) {
 
 export async function fetchAccountRefreshProgress(progressId: string) {
   return httpRequest<AccountRefreshProgress>(`/api/accounts/refresh/progress/${encodeURIComponent(progressId)}`);
+}
+
+export async function startAccountRepair(accessTokens: string[]) {
+  return httpRequest<{ progress_id: string; total: number }>("/api/accounts/repair/start", {
+    method: "POST",
+    body: { access_tokens: accessTokens },
+  });
+}
+
+export async function fetchAccountRepairProgress(progressId: string) {
+  return httpRequest<AccountRefreshProgress>(`/api/accounts/repair/progress/${encodeURIComponent(progressId)}`);
 }
 
 export async function updateAccount(
@@ -719,6 +769,20 @@ export async function updateSettingsConfig(settings: SettingsConfig) {
   return httpRequest<{ config: SettingsConfig }>("/api/settings", {
     method: "POST",
     body: settings,
+  });
+}
+
+export async function testImageStorage(settings: ImageStorageSettings) {
+  return httpRequest<{ result: { ok: boolean; error?: string } }>("/api/image-storage/test", {
+    method: "POST",
+    body: settings,
+  });
+}
+
+export async function syncImageStorage() {
+  return httpRequest<{ result: { uploaded: number; skipped: number; failed: number; thumbnails_uploaded?: number; thumbnails_failed?: number } }>("/api/image-storage/sync", {
+    method: "POST",
+    body: {},
   });
 }
 
@@ -1443,6 +1507,8 @@ export async function* streamChat(
   body: {
     model: string;
     messages: ChatStreamMessage[];
+    size?: string;
+    resolution?: string;
     conversation_id?: string;
     force_switch_account?: boolean;
     account_type?: ChatAccountType;

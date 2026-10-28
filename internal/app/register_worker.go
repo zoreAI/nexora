@@ -1146,16 +1146,19 @@ func authorizeLandingSummary(finalURL, body string) string {
 	return landing
 }
 
-func (s *registerSession) loginWithPassword(ctx context.Context, email, password string) (map[string]any, error) {
+func (s *registerSession) loginWithPassword(ctx context.Context, email, password, mfaSecret string, emailCode ...func(context.Context, time.Time) (string, error)) (map[string]any, error) {
 	email = strings.TrimSpace(email)
 	password = strings.TrimSpace(password)
 	if email == "" || password == "" {
 		return nil, errors.New("email and password are required")
 	}
 	deviceID := uuid4()
-	codeVerifier, err := s.platformAuthorizeWithHint(ctx, deviceID, email, "login_or_signup")
+	codeVerifier, err := s.platformAuthorizeRetry(ctx, deviceID, email, "login_or_signup", true)
 	if err != nil {
 		return nil, err
+	}
+	if !strings.HasPrefix(s.lastAuthorizeLanding, "login path=/log-in/password") {
+		return nil, fmt.Errorf("授权未进入密码登录步骤: %s", s.lastAuthorizeLanding)
 	}
 	sentinel, err := s.createSentinelToken(ctx, deviceID, "password_verify")
 	if err != nil {
@@ -1166,21 +1169,9 @@ func (s *registerSession) loginWithPassword(ctx context.Context, email, password
 	if err != nil {
 		return nil, err
 	}
-	resp, err := s.doBytes(ctx, stdhttp.MethodPost, registerAuthBase+"/api/accounts/password/verify", map[string]string{
-		"Accept":                 "application/json",
-		"Content-Type":           "application/json",
-		"Origin":                 registerAuthBase,
-		"Referer":                registerAuthBase + "/email-verification",
-		"Oai-Device-Id":          deviceID,
-		"OpenAI-Sentinel-Token":  sentinel,
-		"Sec-Fetch-Dest":         "empty",
-		"Sec-Fetch-Mode":         "cors",
-		"Sec-Fetch-Site":         "same-origin",
-		"X-OpenAI-Target-Path":   "/api/accounts/password/verify",
-		"X-OpenAI-Target-Route":  "/api/accounts/password/verify",
-		"X-OpenAI-Device-ID":     deviceID,
-		"X-OpenAI-Sentinel-Flow": "password_verify",
-	}, b, bytes.NewReader(b))
+	headers := s.registerCommonJSONHeaders(deviceID, registerAuthBase+"/")
+	headers["OpenAI-Sentinel-Token"] = sentinel
+	resp, err := s.doBytes(ctx, stdhttp.MethodPost, registerAuthBase+"/api/accounts/password/verify", headers, b, bytes.NewReader(b))
 	if err != nil {
 		return nil, err
 	}
@@ -1193,15 +1184,90 @@ func (s *registerSession) loginWithPassword(ctx context.Context, email, password
 	if resp.StatusCode != 200 {
 		return nil, registerHTTPError(stdhttp.MethodPost, registerAuthBase+"/api/accounts/password/verify", resp.StatusCode, string(raw))
 	}
+	if page, ok := payload["page"].(map[string]any); ok && strAny(page["type"], "") == "mfa_challenge" {
+		if strings.TrimSpace(mfaSecret) == "" {
+			return nil, errors.New("重新授权需要 2FA，账号未保存密钥")
+		}
+		payload, err = s.verifyPasswordLoginMFA(ctx, deviceID, payload, mfaSecret)
+		if err != nil {
+			return nil, err
+		}
+	}
 	continueURL := strings.TrimSpace(strAny(payload["continue_url"], strAny(payload["url"], "")))
 	code := parseContinueCode(continueURL)
 	if code == "" {
 		if page, ok := payload["page"].(map[string]any); ok && strings.TrimSpace(strAny(page["type"], "")) == "email_otp_verification" {
-			return nil, errors.New("重新授权需要邮箱验证码，当前自动流程暂未处理 OTP")
+			if len(emailCode) == 0 || emailCode[0] == nil {
+				return nil, errors.New("重新授权需要邮箱验证码，账号没有可用取码方式")
+			}
+			codeNotBefore := time.Now().UTC()
+			if err := s.sendOTP(ctx, deviceID); err != nil {
+				return nil, fmt.Errorf("发送邮箱验证码失败: %w", err)
+			}
+			otp, err := emailCode[0](ctx, codeNotBefore)
+			if err != nil {
+				return nil, fmt.Errorf("获取邮箱验证码失败: %w", err)
+			}
+			continueURL, err = s.validateOTPContinueURL(ctx, deviceID, otp)
+			if err != nil {
+				return nil, fmt.Errorf("校验邮箱验证码失败: %w", err)
+			}
+			code = parseContinueCode(continueURL)
+			if code == "" {
+				return nil, errors.New("邮箱验证码已校验，但未返回 oauth callback code")
+			}
+		} else {
+			return nil, errors.New("password verify response missing oauth code")
 		}
-		return nil, errors.New("password verify response missing oauth code")
 	}
 	return s.exchangeTokens(ctx, codeVerifier, code)
+}
+
+func (s *registerSession) verifyPasswordLoginMFA(ctx context.Context, deviceID string, passwordResponse map[string]any, secret string) (map[string]any, error) {
+	page, _ := passwordResponse["page"].(map[string]any)
+	payload, _ := page["payload"].(map[string]any)
+	factorID := strings.TrimSpace(strAny(payload["factor_id"], ""))
+	factors, _ := payload["factors"].([]any)
+	totpAvailable := false
+	for _, raw := range factors {
+		factor, _ := raw.(map[string]any)
+		if strAny(factor["id"], "") == factorID && strAny(factor["factor_type"], "") == "totp" {
+			totpAvailable = true
+			break
+		}
+	}
+	if factorID == "" || !totpAvailable {
+		return nil, errors.New("2FA 登录未提供可用的 TOTP 验证方式")
+	}
+	headers := s.registerCommonJSONHeaders(deviceID, registerAuthBase+"/")
+	if _, _, err := s.requestTextResponse(ctx, stdhttp.MethodPost, registerAuthBase+"/api/accounts/mfa/issue_challenge", headers, map[string]any{
+		"id": factorID, "type": "totp", "force_fresh_challenge": false,
+	}, stdhttp.StatusOK); err != nil {
+		return nil, err
+	}
+	code, _, err := freshRegisterTOTP(ctx, secret)
+	if err != nil {
+		return nil, err
+	}
+	sentinel, err := s.createSentinelToken(ctx, deviceID, "verify_mfa")
+	if err != nil {
+		return nil, err
+	}
+	headers["OpenAI-Sentinel-Token"] = sentinel
+	text, _, err := s.requestTextResponse(ctx, stdhttp.MethodPost, registerAuthBase+"/api/accounts/mfa/verify", headers, map[string]any{
+		"id": factorID, "type": "totp", "code": code,
+	}, stdhttp.StatusOK)
+	if err != nil {
+		return nil, err
+	}
+	var result map[string]any
+	if err := json.Unmarshal([]byte(text), &result); err != nil {
+		return nil, fmt.Errorf("解析 2FA 验证响应: %w", err)
+	}
+	if result["continue_url"] == nil {
+		return nil, errors.New("2FA 验证响应缺少继续授权地址")
+	}
+	return result, nil
 }
 
 func (s *registerSession) registerUser(ctx context.Context, deviceID, email, password string) error {
@@ -1808,7 +1874,11 @@ type registerPasswordStepUnavailableError struct {
 func (e registerPasswordStepUnavailableError) Error() string { return e.message }
 
 func (s *registerService) probePasswordSignup(ctx context.Context, cfg RegisterConfig) error {
-	provider, err := s.createProvider(cfg.Mail)
+	route, err := s.resolveRegisterProxy(cfg.Proxy)
+	if err != nil {
+		return err
+	}
+	provider, err := s.createProviderWithProxy(cfg.Mail, route.URL)
 	if err != nil {
 		return err
 	}
@@ -2167,14 +2237,20 @@ func (s *registerService) enabledRegisterProviderCount(mail RegisterMailConfig) 
 
 func (s *registerService) runRegisterTask(ctx context.Context, cfg RegisterConfig, index int) (bool, error) {
 	s.appendLog(fmt.Sprintf("[任务%d] 任务启动", index), "yellow")
+	route, err := s.resolveRegisterProxy(cfg.Proxy)
+	if err != nil {
+		return false, fmt.Errorf("选择注册代理失败: %w", err)
+	}
+	if route.NodeID != "" {
+		s.appendLog(fmt.Sprintf("[任务%d] 注册代理节点[%s]", index, route.NodeID), "yellow")
+	}
 	var provider registerProvider
 	var mailbox *registerMailbox
-	var err error
 	var createErrors []string
 	createAttempts := 0
 	capacityExhaustedAttempts := 0
 	for attempt := 0; attempt < maxInt(s.enabledRegisterProviderCount(cfg.Mail), 1); attempt++ {
-		provider, err = s.createProvider(cfg.Mail)
+		provider, err = s.createProviderWithProxy(cfg.Mail, route.URL)
 		if err != nil {
 			createErrors = append(createErrors, err.Error())
 			createAttempts++
@@ -2477,6 +2553,32 @@ func (b *registerProviderBase) Session() registerProviderSession { return b.sess
 func (b *registerProviderBase) MarkFailed(mailbox *registerMailbox, reason string) {}
 
 func (s *registerService) createProvider(mail RegisterMailConfig) (registerProvider, error) {
+	route, err := s.resolveRegisterProxy(s.snapshot().Proxy)
+	if err != nil {
+		return nil, err
+	}
+	return s.createProviderWithProxy(mail, route.URL)
+}
+
+func (s *registerService) resolveRegisterProxy(raw string) (proxyRoute, error) {
+	raw = strings.TrimSpace(raw)
+	if strings.HasPrefix(raw, "group:") {
+		if s.server == nil {
+			return proxyRoute{}, errors.New("注册代理组需要服务器连接")
+		}
+		return s.server.resolveProxyRoute(proxyReference{Mode: "group", GroupID: strings.TrimPrefix(raw, "group:")})
+	}
+	if raw == "" {
+		return proxyRoute{}, nil
+	}
+	normalized, err := normalizeProxyURL(raw)
+	if err != nil {
+		return proxyRoute{}, err
+	}
+	return proxyRoute{URL: normalized}, nil
+}
+
+func (s *registerService) createProviderWithProxy(mail RegisterMailConfig, registerProxy string) (registerProvider, error) {
 	entries := []map[string]any{}
 	for _, raw := range mail.Providers {
 		if raw == nil {
@@ -2520,7 +2622,7 @@ func (s *registerService) createProvider(mail RegisterMailConfig) (registerProvi
 	}
 	proxy := ""
 	if mail.APIUseRegisterProxy || providerType == "icloud_api" {
-		proxy = s.cfg.Proxy
+		proxy = registerProxy
 	}
 	var binGetter func() (string, error)
 	if s.server != nil {

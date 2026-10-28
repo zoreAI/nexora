@@ -33,7 +33,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	accounts := s.store.LoadAccounts()
-	statuses := map[string]int{"正常": 0, "限流": 0, "异常": 0, "禁用": 0}
+	statuses := map[string]int{"正常": 0, "限流": 0, "异常": 0, "封号": 0, "禁用": 0}
 	quota := 0
 	unknownQuota := 0
 	for _, account := range accounts {

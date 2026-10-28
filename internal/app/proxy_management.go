@@ -415,6 +415,24 @@ func (s *Store) normalizeAccountProxyAssignment(raw string) (string, error) {
 
 func normalizeProxyURL(raw string) (string, error) {
 	raw = strings.TrimSpace(raw)
+	if scheme, authority, ok := strings.Cut(raw, "://"); ok {
+		lowerScheme := strings.ToLower(scheme)
+		if lowerScheme == "socks" {
+			lowerScheme = "socks5"
+		}
+		if lowerScheme == "socks5" || lowerScheme == "socks5h" {
+			if !strings.ContainsAny(authority, "/?#@") && !strings.HasPrefix(authority, "[") {
+				parts := strings.SplitN(authority, ":", 4)
+				if len(parts) == 4 && parts[0] != "" && parts[1] != "" && parts[2] != "" && parts[3] != "" {
+					raw = lowerScheme + "://" + url.UserPassword(parts[2], parts[3]).String() + "@" + parts[0] + ":" + parts[1]
+				} else {
+					raw = lowerScheme + "://" + authority
+				}
+			} else {
+				raw = lowerScheme + "://" + authority
+			}
+		}
+	}
 	u, err := url.Parse(raw)
 	if err != nil || u == nil || u.Scheme == "" || u.Hostname() == "" {
 		return "", errors.New("代理地址必须是完整 URL，例如 http://127.0.0.1:7890")

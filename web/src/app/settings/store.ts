@@ -29,6 +29,7 @@ import {
   type CPARemoteFile,
   type RegisterConfig,
   type SettingsConfig,
+  type ImageStorageSettings,
 } from "@/lib/api";
 
 export const PAGE_SIZE_OPTIONS = ["50", "100", "200"] as const;
@@ -73,6 +74,21 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
     image_poll_interval_secs: Number(config.image_poll_interval_secs || 4),
     image_poll_initial_wait_secs: Number(config.image_poll_initial_wait_secs || 0),
     image_account_concurrency: Number(config.image_account_concurrency || 3),
+    image_storage: {
+      enabled: Boolean(config.image_storage?.enabled),
+      mode: config.image_storage?.mode || "local",
+      webdav_url: String(config.image_storage?.webdav_url || ""),
+      webdav_username: String(config.image_storage?.webdav_username || ""),
+      webdav_password: String(config.image_storage?.webdav_password || ""),
+      webdav_root_path: String(config.image_storage?.webdav_root_path || "chatgpt2api/images"),
+      public_base_url: String(config.image_storage?.public_base_url || ""),
+      r2_endpoint: String(config.image_storage?.r2_endpoint || ""),
+      r2_bucket: String(config.image_storage?.r2_bucket || ""),
+      r2_access_key_id: String(config.image_storage?.r2_access_key_id || ""),
+      r2_secret_access_key: String(config.image_storage?.r2_secret_access_key || ""),
+      r2_prefix: String(config.image_storage?.r2_prefix || "images"),
+      r2_public_url: String(config.image_storage?.r2_public_url || ""),
+    },
     auto_remove_invalid_accounts: Boolean(config.auto_remove_invalid_accounts),
     auto_remove_rate_limited_accounts: Boolean(config.auto_remove_rate_limited_accounts),
     log_levels: Array.isArray(config.log_levels) ? config.log_levels : [],
@@ -214,6 +230,7 @@ type SettingsStore = {
   setImagePollIntervalSecs: (value: string) => void;
   setImagePollInitialWaitSecs: (value: string) => void;
   setImageAccountConcurrency: (value: string) => void;
+  setImageStorageField: (key: keyof ImageStorageSettings, value: string | boolean) => void;
   setAutoRemoveInvalidAccounts: (value: boolean) => void;
   setAutoRemoveRateLimitedAccounts: (value: boolean) => void;
   setLogLevel: (level: string, enabled: boolean) => void;
@@ -383,6 +400,21 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         image_poll_interval_secs: Math.max(1, Number(config.image_poll_interval_secs) || 4),
         image_poll_initial_wait_secs: Math.max(0, Number(config.image_poll_initial_wait_secs) || 0),
         image_account_concurrency: Math.max(1, Number(config.image_account_concurrency) || 3),
+        image_storage: {
+          enabled: Boolean(config.image_storage?.enabled),
+          mode: config.image_storage?.enabled ? config.image_storage.mode : "local",
+          webdav_url: String(config.image_storage?.webdav_url || "").trim(),
+          webdav_username: String(config.image_storage?.webdav_username || "").trim(),
+          webdav_password: String(config.image_storage?.webdav_password || ""),
+          webdav_root_path: String(config.image_storage?.webdav_root_path || "chatgpt2api/images").trim(),
+          public_base_url: String(config.image_storage?.public_base_url || "").trim(),
+          r2_endpoint: String(config.image_storage?.r2_endpoint || "").trim(),
+          r2_bucket: String(config.image_storage?.r2_bucket || "").trim(),
+          r2_access_key_id: String(config.image_storage?.r2_access_key_id || "").trim(),
+          r2_secret_access_key: String(config.image_storage?.r2_secret_access_key || ""),
+          r2_prefix: String(config.image_storage?.r2_prefix || "images").trim(),
+          r2_public_url: String(config.image_storage?.r2_public_url || "").trim(),
+        },
         auto_remove_invalid_accounts: Boolean(config.auto_remove_invalid_accounts),
         auto_remove_rate_limited_accounts: Boolean(config.auto_remove_rate_limited_accounts),
         proxy: config.proxy.trim(),
@@ -463,6 +495,13 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
 
   setImageAccountConcurrency: (value) => {
     set((state) => state.config ? { config: { ...state.config, image_account_concurrency: value }, isDirty: true } : {});
+  },
+
+  setImageStorageField: (key, value) => {
+    set((state) => state.config?.image_storage ? {
+      config: { ...state.config, image_storage: { ...state.config.image_storage, [key]: value } },
+      isDirty: true,
+    } : {});
   },
 
   setAutoRemoveInvalidAccounts: (value) => {

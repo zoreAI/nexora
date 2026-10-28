@@ -102,6 +102,37 @@ func TestNormalizeProxyURL(t *testing.T) {
 	}
 }
 
+func TestNormalizeProxyURLAcceptsSOCKSNodeFormats(t *testing.T) {
+	tests := map[string]string{
+		"http://127.0.0.1:7897":                   "http://127.0.0.1:7897",
+		"socks://proxy.example:35086:user:pass":   "socks5://user:pass@proxy.example:35086",
+		"socks5h://proxy.example:35087:user:pass": "socks5h://user:pass@proxy.example:35087",
+		"socks://user:pass@proxy.example:35086":   "socks5://user:pass@proxy.example:35086",
+	}
+	for raw, want := range tests {
+		got, err := normalizeProxyURL(raw)
+		if err != nil || got != want {
+			t.Errorf("normalizeProxyURL(%q) = %q, %v; want %q", raw, got, err, want)
+		}
+	}
+}
+
+func TestSaveProxyGroupNormalizesSOCKSNodeFormats(t *testing.T) {
+	store := NewStore(filepath.Join(t.TempDir(), "data"))
+	defer store.Close()
+	group, err := store.SaveProxyGroup(proxyGroupInput{Name: "mixed", Nodes: []proxyNodeInput{
+		{URL: "http://127.0.0.1:7897"},
+		{URL: "socks://proxy.example:35086:user:pass"},
+		{URL: "socks5h://proxy.example:35087:user:pass"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(group.Nodes) != 3 || group.Nodes[1].URL != "socks5://user:pass@proxy.example:35086" || group.Nodes[2].URL != "socks5h://user:pass@proxy.example:35087" {
+		t.Fatal("proxy group did not save canonical SOCKS URLs")
+	}
+}
+
 func TestDuplicateProxyNodeErrorRedactsCredentials(t *testing.T) {
 	store := NewStore(filepath.Join(t.TempDir(), "data"))
 	defer store.Close()

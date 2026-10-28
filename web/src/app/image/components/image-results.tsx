@@ -72,6 +72,10 @@ function isQuotaError(message: string | undefined | null) {
   return message.includes("额度不足");
 }
 
+function isTechnicalImageError(message: string) {
+  return /^(?:codex image generation failed:|(?:GET|POST|PUT|DELETE) \/|(?:GET|POST|PUT|DELETE) https?:\/\/)/i.test(message);
+}
+
 async function downloadStoredImage(image: StoredImage, index: number) {
   let blob: Blob;
   if (image.b64_json) {
@@ -590,7 +594,7 @@ export function ImageResults({
                                   <RotateCcw className="size-3" />
                                   重试
                                 </button>
-                                {onReplyToTurn && image.error ? (
+                                {onReplyToTurn && image.error && !isTechnicalImageError(image.error) ? (
                                   <div className="relative inline-flex items-center gap-1">
                                     <button
                                       type="button"

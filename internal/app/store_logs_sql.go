@@ -104,6 +104,88 @@ func isDuplicateColumnError(err error) bool {
 	return strings.Contains(message, "duplicate column") || strings.Contains(message, "already exists")
 }
 
+func (s *Store) mergeLegacyCallLogs() error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if s.backend == "postgres" {
+		if _, err := tx.Exec("SELECT pg_advisory_xact_lock(hashtext('chatgpt2api_call_logs_v1'))"); err != nil {
+			return err
+		}
+	}
+	var marker string
+	if err := tx.QueryRow("SELECT name FROM app_migrations WHERE name = 'call_logs_v1'").Scan(&marker); err == nil {
+		return tx.Commit()
+	} else if err != sql.ErrNoRows {
+		return err
+	}
+	rows, err := tx.Query("SELECT seq, payload FROM app_logs WHERE log_type = 'call' AND outcome IN ('started', 'success', 'failed', 'partial_success') ORDER BY seq")
+	if err != nil {
+		return err
+	}
+	type logRow struct {
+		seq     int64
+		payload string
+	}
+	var logs []logRow
+	for rows.Next() {
+		var row logRow
+		if err := rows.Scan(&row.seq, &row.payload); err != nil {
+			rows.Close()
+			return err
+		}
+		logs = append(logs, row)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	starts := map[string]logRow{}
+	for _, row := range logs {
+		var item map[string]any
+		if json.Unmarshal([]byte(row.payload), &item) != nil {
+			continue
+		}
+		detail, _ := item["detail"].(map[string]any)
+		callID := strAny(detail["call_id"], "")
+		if callID == "" {
+			continue
+		}
+		if strAny(detail["status"], "") == "started" {
+			starts[callID] = row
+			continue
+		}
+		start, ok := starts[callID]
+		if !ok {
+			continue
+		}
+		var first map[string]any
+		if json.Unmarshal([]byte(start.payload), &first) != nil {
+			continue
+		}
+		mergeCallLog(first, strAny(item["summary"], ""), detail)
+		payload, err := json.Marshal(first)
+		if err != nil {
+			return err
+		}
+		query := "UPDATE app_logs SET payload = " + s.bind(1) + ", outcome = " + s.bind(2) + ", search_text = " + s.bind(3) + " WHERE seq = " + s.bind(4)
+		if _, err := tx.Exec(query, string(payload), strAny(detail["status"], ""), callLogSearch(first), start.seq); err != nil {
+			return err
+		}
+		if _, err := tx.Exec("DELETE FROM app_logs WHERE seq = "+s.bind(1), row.seq); err != nil {
+			return err
+		}
+		delete(starts, callID)
+	}
+	if _, err := tx.Exec("INSERT INTO app_migrations (name) VALUES ('call_logs_v1') ON CONFLICT (name) DO NOTHING"); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 type logQuery struct {
 	typ, startDate, endDate, status, endpoint, model, search string
 }

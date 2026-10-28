@@ -12,6 +12,7 @@ import {
   Download,
   LayoutGrid,
   KeyRound,
+  LogIn,
   LoaderCircle,
   MoreHorizontal,
   Pencil,
@@ -48,10 +49,14 @@ import {
   deleteAccounts,
   fetchAccountGroups,
   fetchAccountRefreshProgress,
+  fetchAccountRepairProgress,
   fetchAccounts,
   fetchAccountMFACode,
+  fetchModels,
   fetchProxyGroups,
+  loginAbnormalAccountWithMFA,
   startAccountRefresh,
+  startAccountRepair,
   updateAccount,
   updateAccountsGroup,
   updateAccountsStatus,
@@ -59,6 +64,7 @@ import {
   type AccountGroup,
   type AccountRefreshProgress,
   type AccountStatus,
+  type Model,
   type ProxyGroup,
 } from "@/lib/api";
 import { useAuthGuard } from "@/lib/use-auth-guard";
@@ -72,6 +78,7 @@ const accountStatusOptions: { label: string; value: AccountStatus | "all" }[] = 
   { label: "正常", value: "正常" },
   { label: "限流", value: "限流" },
   { label: "异常", value: "异常" },
+  { label: "封号", value: "封号" },
   { label: "禁用", value: "禁用" },
 ];
 
@@ -90,6 +97,7 @@ const metricCards = [
   { key: "active", label: "正常账户", color: "text-emerald-600", icon: CheckCircle2 },
   { key: "limited", label: "限流账户", color: "text-orange-500", icon: CircleAlert },
   { key: "abnormal", label: "异常账户", color: "text-rose-500", icon: CircleOff },
+  { key: "banned", label: "封号账户", color: "text-red-700", icon: Ban },
   { key: "disabled", label: "禁用账户", color: "text-stone-500", icon: Ban },
   { key: "quota", label: "剩余额度", color: "text-blue-500", icon: RefreshCw },
 ] as const;
@@ -241,6 +249,7 @@ const STATUS_BADGE_CLASS: Record<AccountStatus, string> = {
   正常: "border-emerald-200 bg-emerald-50 text-emerald-700",
   限流: "border-amber-200 bg-amber-50 text-amber-700",
   异常: "border-rose-200 bg-rose-50 text-rose-700",
+  封号: "border-red-300 bg-red-100 text-red-800",
   禁用: "border-stone-200 bg-stone-100 text-stone-600",
 };
 
@@ -311,6 +320,7 @@ function AccountCard({
   onSelectChange,
   onEdit,
   onRefresh,
+  onMFALogin,
   onToggleStatus,
   onDelete,
   onCopyToken,
@@ -318,6 +328,7 @@ function AccountCard({
   onCopyMFA,
   onCopyMFACode,
   isRefreshing,
+  isMFALoggingIn,
   isDeleting,
   isUpdating,
 }: {
@@ -327,6 +338,7 @@ function AccountCard({
   onSelectChange: (v: boolean) => void;
   onEdit: () => void;
   onRefresh: () => void;
+  onMFALogin: () => void;
   onToggleStatus: () => void;
   onDelete: () => void;
   onCopyToken: () => void;
@@ -334,6 +346,7 @@ function AccountCard({
   onCopyMFA: () => void;
   onCopyMFACode: () => void;
   isRefreshing: boolean;
+  isMFALoggingIn: boolean;
   isDeleting: boolean;
   isUpdating: boolean;
 }) {
@@ -500,6 +513,11 @@ function AccountCard({
         >
           <RefreshCw className={cn("size-4", isRefreshing && "animate-spin")} />
         </button>
+        {account.status === "异常" && account.mfa_secret ? (
+          <button type="button" className="cursor-pointer rounded-md p-1.5 transition hover:bg-secondary hover:text-foreground disabled:opacity-50" onClick={onMFALogin} disabled={isMFALoggingIn || !account.email || !account.password} title={!account.email || !account.password ? "缺少邮箱或登录密码" : "使用密码和 2FA 尝试登录"} aria-label="使用密码和 2FA 尝试登录">
+            {isMFALoggingIn ? <LoaderCircle className="size-4 animate-spin" /> : <LogIn className="size-4" />}
+          </button>
+        ) : null}
         <button
           type="button"
           className="cursor-pointer rounded-md p-1.5 transition hover:bg-secondary hover:text-foreground disabled:opacity-50"
@@ -534,6 +552,9 @@ function AccountsPageContent() {
   // 命中模块级缓存时直接拿来当初始 state，避免再次切到号池页时
   // accounts 从 [] 起跳、isLoading=true 让大表格塌缩成 spinner 再撑回。
   const [accounts, setAccountsState] = useState<Account[]>(() => cachedAccounts ?? []);
+  const [availableModels, setAvailableModels] = useState<Model[]>([]);
+  const [isLoadingModels, setIsLoadingModels] = useState(true);
+  const [modelsError, setModelsError] = useState("");
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [query, setQuery] = useState("");
   const [typeFilter, setTypeFilter] = useState("all");
@@ -552,8 +573,12 @@ function AccountsPageContent() {
   const [editProxyURL, setEditProxyURL] = useState("");
   const [isLoading, setIsLoading] = useState(() => cachedAccounts === null);
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [mfaLoginToken, setMFALoginToken] = useState<string | null>(null);
   const [refreshProgress, setRefreshProgress] = useState<AccountRefreshProgress | null>(null);
   const [activeRefreshId, setActiveRefreshId] = useState<string | null>(null);
+  const [repairProgress, setRepairProgress] = useState<AccountRefreshProgress | null>(null);
+  const [activeRepairId, setActiveRepairId] = useState<string | null>(null);
+  const [isStartingRepair, setIsStartingRepair] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
   const [isUpdating, setIsUpdating] = useState(false);
   const [isBatchUpdating, setIsBatchUpdating] = useState(false);
@@ -606,6 +631,48 @@ function AccountsPageContent() {
       setIsRefreshing(true);
     }
   }, []);
+
+  useEffect(() => {
+    const savedId = window.sessionStorage.getItem("accounts.repairProgressId");
+    if (savedId) setActiveRepairId(savedId);
+  }, []);
+
+  useEffect(() => {
+    if (!activeRepairId) return;
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const poll = async () => {
+      try {
+        const progress = await fetchAccountRepairProgress(activeRepairId);
+        if (stopped) return;
+        setRepairProgress(progress);
+        if (progress.done) {
+          window.sessionStorage.removeItem("accounts.repairProgressId");
+          setActiveRepairId(null);
+          void loadAccounts(true, true);
+          if (progress.failed > 0) toast.error(`修复成功 ${progress.refreshed} 个，失败 ${progress.failed} 个`);
+          else toast.success(`修复成功 ${progress.refreshed} 个账号`);
+          return;
+        }
+        timer = setTimeout(() => void poll(), 3000);
+      } catch (error) {
+        if (stopped) return;
+        if (error instanceof Error && error.message === "progress not found") {
+          window.sessionStorage.removeItem("accounts.repairProgressId");
+          setActiveRepairId(null);
+          setRepairProgress(null);
+          toast.error("修复任务已失效，请重新发起");
+          return;
+        }
+        timer = setTimeout(() => void poll(), 5000);
+      }
+    };
+    void poll();
+    return () => {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [activeRepairId]);
 
   useEffect(() => {
     if (!activeRefreshId) return;
@@ -672,6 +739,28 @@ function AccountsPageContent() {
     }
   };
 
+  const loadModels = async () => {
+    setIsLoadingModels(true);
+    setModelsError("");
+    try {
+      const data = await fetchModels();
+      setAvailableModels(Array.isArray(data.data) ? data.data.filter((model) => Boolean(model.id)) : []);
+    } catch (error) {
+      setModelsError(error instanceof Error ? error.message : "加载模型列表失败");
+    } finally {
+      setIsLoadingModels(false);
+    }
+  };
+
+  const copyModel = async (model: string) => {
+    try {
+      await navigator.clipboard.writeText(model);
+      toast.success("模型名已复制");
+    } catch {
+      toast.error("复制模型名失败");
+    }
+  };
+
   // 进度条状态机：任一操作中立刻显示，操作结束后再保留 1.2s 让滑动动画走完一程，
   // 避免缓存命中（几十毫秒返回）时进度条一闪而过。
   useEffect(() => {
@@ -691,6 +780,7 @@ function AccountsPageContent() {
     didLoadRef.current = true;
     // 已有缓存：后台静默刷新，不让大表格塌缩。
     void loadAccounts(cachedAccounts !== null);
+    void loadModels();
   }, []);
 
   useEffect(() => {
@@ -730,10 +820,11 @@ function AccountsPageContent() {
     const active = accounts.filter((item) => item.status === "正常").length;
     const limited = accounts.filter((item) => item.status === "限流").length;
     const abnormal = accounts.filter((item) => item.status === "异常").length;
+    const banned = accounts.filter((item) => item.status === "封号").length;
     const disabled = accounts.filter((item) => item.status === "禁用").length;
     const quota = formatQuotaSummary(accounts);
 
-    return { total, active, limited, abnormal, disabled, quota };
+    return { total, active, limited, abnormal, banned, disabled, quota };
   }, [accounts]);
 
   const accountTypeOptions = useMemo(
@@ -753,6 +844,8 @@ function AccountsPageContent() {
     const selectedSet = new Set(selectedIds);
     return accounts.filter((item) => selectedSet.has(item.access_token));
   }, [accounts, selectedIds]);
+
+  const selectedAbnormalTokens = useMemo(() => selectedAccounts.filter((item) => item.status === "异常").map((item) => item.access_token), [selectedAccounts]);
 
   const abnormalTokens = useMemo(() => {
     return accounts.filter((item) => item.status === "异常").map((item) => item.access_token);
@@ -808,6 +901,37 @@ function AccountsPageContent() {
       const message = error instanceof Error ? error.message : "刷新账户失败";
       toast.error(message);
       setIsRefreshing(false);
+    }
+  };
+
+  const handleMFALogin = async (account: Account) => {
+    setMFALoginToken(account.access_token);
+    try {
+      await loginAbnormalAccountWithMFA(account.access_token);
+      toast.success(`${account.email} 登录成功`);
+      await loadAccounts(true, true);
+    } catch (error) {
+      toast.error(`${account.email} 登录失败：${error instanceof Error ? error.message : "未知错误"}`);
+    } finally {
+      setMFALoginToken(null);
+    }
+  };
+
+  const handleRepairSelected = async () => {
+    if (selectedAbnormalTokens.length === 0 || activeRepairId || isStartingRepair) return;
+    const requestedCount = selectedAbnormalTokens.length;
+    setIsStartingRepair(true);
+    setRepairProgress(null);
+    try {
+      const started = await startAccountRepair(selectedAbnormalTokens);
+      window.sessionStorage.setItem("accounts.repairProgressId", started.progress_id);
+      setActiveRepairId(started.progress_id);
+      const count = typeof started.total === "number" && Number.isFinite(started.total) ? started.total : requestedCount;
+      toast.success(`已启动 ${count} 个异常账号的修复`);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "启动修复失败");
+    } finally {
+      setIsStartingRepair(false);
     }
   };
 
@@ -943,6 +1067,24 @@ function AccountsPageContent() {
         </section>
       ) : null}
 
+      {repairProgress ? (
+        <section className="space-y-2 py-2" aria-live="polite">
+          <div className="flex flex-wrap items-center justify-between gap-2 text-sm">
+            <span className="font-medium">{repairProgress.done ? "异常账号修复完成" : "正在修复异常账号"}</span>
+            <span className="font-data tabular-nums text-muted-foreground">{repairProgress.processed}/{repairProgress.total} · 成功 {repairProgress.refreshed} · 失败 {repairProgress.failed}</span>
+          </div>
+          <div className="h-1.5 overflow-hidden rounded-full bg-stone-200" role="progressbar" aria-valuenow={repairProgress.processed} aria-valuemin={0} aria-valuemax={repairProgress.total}>
+            <div className="h-full bg-emerald-600 transition-all" style={{ width: `${repairProgress.total ? (repairProgress.processed / repairProgress.total) * 100 : 0}%` }} />
+          </div>
+          {repairProgress.errors.length > 0 ? (
+            <details className="text-xs text-rose-700">
+              <summary className="cursor-pointer">失败账号（{repairProgress.failed}）</summary>
+              <ul className="mt-2 space-y-1">{repairProgress.errors.map((item, index) => <li key={index}>{item.account}: {item.error}</li>)}</ul>
+            </details>
+          ) : null}
+        </section>
+      ) : null}
+
       <Dialog open={Boolean(editingAccount)} onOpenChange={(open) => (!open ? setEditingAccount(null) : null)}>
         <DialogContent showCloseButton={false} className="rounded-2xl p-6">
           <DialogHeader className="gap-2">
@@ -1040,6 +1182,27 @@ function AccountsPageContent() {
             );
           })}
         </div>
+      </section>
+
+      <section className="border-b border-border py-4" aria-label="系统可用模型">
+        <div className="mb-3 flex items-center gap-2">
+          <h2 className="text-sm font-medium">系统可用模型 <span className="text-muted-foreground">({availableModels.length})</span></h2>
+          <Button variant="ghost" size="icon" className="size-7 rounded-md" onClick={() => void loadModels()} disabled={isLoadingModels} title="刷新模型列表" aria-label="刷新模型列表">
+            <RefreshCw className={cn("size-3.5", isLoadingModels && "animate-spin")} />
+          </Button>
+        </div>
+        {availableModels.length > 0 ? (
+          <div className="flex flex-wrap gap-2">
+            {availableModels.map((model) => (
+              <button key={model.id} type="button" onClick={() => void copyModel(model.id)} title={`点击复制 ${model.id}`} className="inline-flex max-w-full items-center gap-1.5 rounded-md border border-border bg-background px-2.5 py-1 text-xs text-foreground transition hover:bg-secondary">
+                <Copy className="size-3 shrink-0 text-muted-foreground" />
+                <span className="break-all text-left">{model.id}</span>
+              </button>
+            ))}
+          </div>
+        ) : (
+          <p className="text-sm text-muted-foreground">{isLoadingModels ? "正在加载模型列表..." : modelsError || "当前暂无可用模型"}</p>
+        )}
       </section>
 
       <section className="pt-4">
@@ -1218,6 +1381,7 @@ function AccountsPageContent() {
               <div className="my-1 border-t border-border" />
               <button type="button" disabled={selectedTokens.length === 0 || isBatchUpdating} onClick={() => void handleUpdateStatuses(selectedTokens, "正常")} className="w-full rounded-sm px-3 py-2 text-left text-sm hover:bg-secondary disabled:opacity-40">批量启用</button>
               <button type="button" disabled={selectedTokens.length === 0 || isBatchUpdating} onClick={() => void handleUpdateStatuses(selectedTokens, "禁用")} className="w-full rounded-sm px-3 py-2 text-left text-sm hover:bg-secondary disabled:opacity-40">批量禁用</button>
+              <button type="button" disabled={selectedAbnormalTokens.length === 0 || activeRepairId !== null || isStartingRepair} onClick={() => void handleRepairSelected()} className="w-full rounded-sm px-3 py-2 text-left text-sm hover:bg-secondary disabled:opacity-40">修复选中异常账号（{selectedAbnormalTokens.length}）</button>
               <button type="button" disabled={abnormalTokens.length === 0 || isDeleting} onClick={() => void handleDeleteTokens(abnormalTokens)} className="w-full rounded-sm px-3 py-2 text-left text-sm text-rose-600 hover:bg-rose-50 disabled:opacity-40">移除异常账号</button>
               <button type="button" disabled={selectedTokens.length === 0 || isDeleting} onClick={() => void handleDeleteTokens(selectedTokens)} className="w-full rounded-sm px-3 py-2 text-left text-sm text-rose-600 hover:bg-rose-50 disabled:opacity-40">删除选中</button>
             </PopoverContent>
@@ -1346,6 +1510,7 @@ function AccountsPageContent() {
                                 account.status === "正常" && "bg-emerald-500 ring-emerald-500/15",
                                 account.status === "限流" && "bg-amber-500 ring-amber-500/15",
                                 account.status === "异常" && "bg-rose-500 ring-rose-500/15",
+                                account.status === "封号" && "bg-red-700 ring-red-700/15",
                                 account.status === "禁用" && "bg-stone-400 ring-stone-400/15",
                               )}
                             />
@@ -1439,6 +1604,11 @@ function AccountsPageContent() {
                             >
                               <RefreshCw className={cn("size-4", isRefreshing ? "animate-spin" : "")} />
                             </button>
+                            {account.status === "异常" && account.mfa_secret ? (
+                              <button type="button" title={!account.email || !account.password ? "缺少邮箱或登录密码" : "使用密码和 2FA 尝试登录"} aria-label="使用密码和 2FA 尝试登录" className="cursor-pointer rounded-md p-1.5 transition hover:bg-secondary hover:text-foreground disabled:opacity-50" onClick={() => void handleMFALogin(account)} disabled={mfaLoginToken !== null || !account.email || !account.password}>
+                                {mfaLoginToken === account.access_token ? <LoaderCircle className="size-4 animate-spin" /> : <LogIn className="size-4" />}
+                              </button>
+                            ) : null}
                             <button
                               type="button"
                               title={account.status === "禁用" ? "启用账号" : "禁用账号"}
@@ -1484,6 +1654,7 @@ function AccountsPageContent() {
                     }}
                     onEdit={() => openEditDialog(account)}
                     onRefresh={() => void handleRefreshAccounts([account.access_token])}
+                    onMFALogin={() => void handleMFALogin(account)}
                     onToggleStatus={() => void handleUpdateStatuses([account.access_token], account.status === "禁用" ? "正常" : "禁用")}
                     onDelete={() => void handleDeleteTokens([account.access_token])}
                     onCopyToken={() => {
@@ -1498,6 +1669,7 @@ function AccountsPageContent() {
                     }}
                     onCopyMFACode={() => void copyMFACode(account)}
                     isRefreshing={isRefreshing}
+                    isMFALoggingIn={mfaLoginToken !== null}
                     isDeleting={isDeleting}
                     isUpdating={isUpdating}
                   />

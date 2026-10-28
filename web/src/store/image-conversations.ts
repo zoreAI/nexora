@@ -14,6 +14,7 @@ export type StoredReferenceImage = {
 
 export type StoredImage = {
   id: string;
+  image_rel?: string;
   taskId?: string;
   status?: "loading" | "success" | "error";
   b64_json?: string;

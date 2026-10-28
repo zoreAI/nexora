@@ -6,6 +6,7 @@ import { LoaderCircle } from "lucide-react";
 import { useAuthGuard } from "@/lib/use-auth-guard";
 
 import { FloatingSaveBar } from "./components/floating-save-bar";
+import { ApiDocsSection } from "./components/api-docs-section";
 import { Section } from "./components/section";
 import { SettingsHeader } from "./components/settings-header";
 import { SettingsTOC, type TOCItem } from "./components/settings-toc";
@@ -31,6 +32,7 @@ const SECTIONS: Array<TOCItem & { description: string }> = [
   { id: "security", label: "内容安全", description: "敏感词与全局附加指令——把审查放在请求落到生图账号之前。" },
   { id: "ai-review", label: "AI 审核", description: "用一个独立模型对用户提示词做合规判断，命中即拒绝。" },
   { id: "logs", label: "日志", description: "控制台输出级别。debug 仅排查问题时打开。" },
+  { id: "api-docs", label: "接口接入说明", description: "查看服务地址、鉴权方式和常用接口调用示例。" },
 ];
 
 function SettingsDataController() {
@@ -65,6 +67,8 @@ function SectionBody({ id }: { id: string }) {
       return <AIReviewSection />;
     case "logs":
       return <LogSection />;
+    case "api-docs":
+      return <ApiDocsSection />;
     default:
       return null;
   }

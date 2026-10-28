@@ -151,7 +151,7 @@ export function ProxySettingsCard() {
                 className="h-11 rounded-xl border-stone-200 bg-white font-mono text-xs"
               />
               <div className="text-xs text-stone-400">
-                支持 <code className="font-mono">http / https / socks4 / socks5 / socks5h</code>。
+                支持 <code className="font-mono">http / https / socks / socks5 / socks5h</code>，<code className="font-mono">socks</code> 按 SOCKS5 处理。
               </div>
             </div>
 

@@ -5,7 +5,6 @@ import {
   ChevronDown,
   FileArchive,
   FileText,
-  KeyRound,
   ListChecks,
   type LucideIcon,
 } from "lucide-react";
@@ -274,17 +273,7 @@ export function ApiDocsSection() {
   }, []);
 
   return (
-    <div className="space-y-5 rounded-2xl border border-stone-200 bg-white p-6 shadow-sm">
-      <div>
-        <div className="flex items-center gap-2 text-base font-semibold text-stone-900">
-          <KeyRound className="size-5 text-stone-500" />
-          接口接入说明
-        </div>
-        <p className="mt-1 text-xs leading-6 text-stone-500">
-          第三方应用按 OpenAI 兼容接口接入；图片任务接口也使用同一套鉴权方式。
-        </p>
-      </div>
-
+    <div className="space-y-5">
       <div className="grid gap-3 md:grid-cols-2">
         <div className="space-y-1 rounded-xl border border-stone-200 bg-white px-3 py-2">
           <div className="text-xs text-stone-500">服务地址</div>

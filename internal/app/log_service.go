@@ -23,8 +23,12 @@ func newLogService(dataDir string) *logService {
 }
 
 func (l *logService) add(typ, summary string, detail map[string]any) {
+	l.addWithID(randID(8), typ, summary, detail)
+}
+
+func (l *logService) addWithID(id, typ, summary string, detail map[string]any) {
 	item := map[string]any{
-		"id":      randID(8),
+		"id":      id,
 		"time":    time.Now().Format("2006-01-02 15:04:05"),
 		"type":    typ,
 		"summary": summary,
@@ -78,7 +82,7 @@ func (s *Server) logCallStart(id *Identity, endpoint, model, action, requestText
 	if strings.TrimSpace(requestText) != "" {
 		detail["request_text"] = truncateText(requestText, 500)
 	}
-	s.logSvc.add("call", action+"开始", detail)
+	s.logSvc.addWithID(callID, "call", action+"开始", detail)
 	return callID
 }
 
@@ -90,7 +94,7 @@ func (s *Server) logCallSuccess(callID, endpoint, model, action string, extra ma
 	for k, v := range extra {
 		detail[k] = v
 	}
-	s.logSvc.add("call", action+"完成", detail)
+	s.logSvc.finishCall(callID, action+"完成", detail)
 }
 
 func (s *Server) logCallFailure(callID, endpoint, model, action string, err error, extra map[string]any) {
@@ -104,7 +108,68 @@ func (s *Server) logCallFailure(callID, endpoint, model, action string, err erro
 	for k, v := range extra {
 		detail[k] = v
 	}
-	s.logSvc.add("call", action+"失败", detail)
+	s.logSvc.finishCall(callID, action+"失败", detail)
+}
+
+func (l *logService) finishCall(callID, summary string, detail map[string]any) {
+	l.mu.Lock()
+	updated := false
+	if l.store != nil {
+		var payload string
+		if err := l.store.db.QueryRow("SELECT payload FROM app_logs WHERE id = "+l.store.bind(1)+" AND log_type = 'call' AND outcome = 'started' ORDER BY seq DESC LIMIT 1", callID).Scan(&payload); err == nil {
+			var item map[string]any
+			if json.Unmarshal([]byte(payload), &item) == nil {
+				mergeCallLog(item, summary, detail)
+				if data, err := json.Marshal(item); err == nil {
+					search := callLogSearch(item)
+					query := "UPDATE app_logs SET payload = " + l.store.bind(1) + ", outcome = " + l.store.bind(2) + ", search_text = " + l.store.bind(3) + " WHERE id = " + l.store.bind(4) + " AND log_type = 'call' AND outcome = 'started'"
+					if result, err := l.store.db.Exec(query, string(data), strAny(detail["status"], ""), search, callID); err == nil {
+						n, _ := result.RowsAffected()
+						updated = n > 0
+					} else {
+						log.Printf("storage finish call: %v", err)
+					}
+				}
+			}
+		}
+	} else if data, err := os.ReadFile(l.path); err == nil {
+		lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+		for i := len(lines) - 1; i >= 0; i-- {
+			var item map[string]any
+			if json.Unmarshal([]byte(lines[i]), &item) != nil || strAny(item["id"], "") != callID {
+				continue
+			}
+			mergeCallLog(item, summary, detail)
+			if payload, err := json.Marshal(item); err == nil {
+				lines[i] = string(payload)
+				if err := os.WriteFile(l.path, []byte(strings.Join(lines, "\n")+"\n"), 0644); err == nil {
+					updated = true
+				}
+			}
+			break
+		}
+	}
+	l.mu.Unlock()
+	if !updated {
+		l.addWithID(callID, "call", summary, detail)
+	}
+}
+
+func mergeCallLog(item map[string]any, summary string, detail map[string]any) {
+	previous, _ := item["detail"].(map[string]any)
+	if previous == nil {
+		previous = map[string]any{}
+	}
+	for key, value := range detail {
+		previous[key] = value
+	}
+	item["detail"] = previous
+	item["summary"] = summary
+}
+
+func callLogSearch(item map[string]any) string {
+	detail, _ := item["detail"].(map[string]any)
+	return strings.ToLower(strings.Join([]string{strAny(item["summary"], ""), strAny(detail["request_text"], ""), strAny(detail["error"], "")}, " "))
 }
 
 func (s *Server) callDurationMS(callID string) int64 {

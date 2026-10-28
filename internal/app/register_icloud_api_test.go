@@ -64,6 +64,56 @@ func TestICloudAPIRegisterProviderClaimsAndReadsCode(t *testing.T) {
 	}
 }
 
+func TestAccountEmailCodeReadsExistingICloudMailboxWithoutClaim(t *testing.T) {
+	requests := 0
+	mailAPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.Method != http.MethodGet || r.URL.Path != "/api/v1/mailboxes/alias@icloud.com/code" {
+			t.Errorf("unexpected mailbox request: %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer test-key" || r.URL.Query().Get("after") == "" {
+			t.Error("missing mailbox authorization or OTP cutoff")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"success":true,"email":"alias@icloud.com","code":"123456"}`))
+	}))
+	defer mailAPI.Close()
+	s := &Server{register: &registerService{cfg: RegisterConfig{Mail: RegisterMailConfig{
+		RequestTimeout: 2,
+		Providers:      []map[string]any{{"type": "icloud_api", "enable": true, "api_base": mailAPI.URL, "api_key": "test-key"}},
+	}}}}
+	session, err := newRegisterSession("", 2, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.close()
+	email := "alias@icloud.com"
+	account := Account{Email: &email}
+	if !s.canReadAccountEmailCode(account) {
+		t.Fatal("configured iCloud API should support an account without mailbox metadata")
+	}
+	code, err := s.waitAccountEmailCode(context.Background(), session, account, email, "", time.Now().UTC())
+	if err != nil || code != "123456" || requests != 1 {
+		t.Fatalf("code = %q, requests = %d, err = %v", code, requests, err)
+	}
+}
+
+func TestAccountEmailCodeRequiresConfiguredProvider(t *testing.T) {
+	email := "alias@icloud.com"
+	account := Account{Email: &email}
+	if (&Server{}).canReadAccountEmailCode(account) {
+		t.Fatal("iCloud address alone must not count as a configured code reader")
+	}
+	s := &Server{register: &registerService{cfg: RegisterConfig{Mail: RegisterMailConfig{
+		Providers: []map[string]any{{"type": "icloud_api", "enable": false}},
+	}}}}
+	if s.canReadAccountEmailCode(account) {
+		t.Fatal("disabled iCloud provider must not enable email login")
+	}
+}
+
 func TestICloudAPIRegisterProviderRejectsMissingKeyAndLegacyType(t *testing.T) {
 	session, err := newRegisterSession("", 1, nil)
 	if err != nil {
@@ -129,5 +179,35 @@ func TestICloudAPIRegisterProviderKeepsRegistrationProxyWhenMailIsDirect(t *test
 	mailTransport := ic.mailSess.client.Transport.(*http.Transport)
 	if registerTransport.Proxy == nil || mailTransport.Proxy != nil {
 		t.Fatal("registration must use the configured proxy while mail API stays direct")
+	}
+}
+
+func TestICloudAPIRegisterProviderUsesSelectedGroupNode(t *testing.T) {
+	store := NewStore(t.TempDir())
+	defer store.Close()
+	group, err := store.SaveProxyGroup(proxyGroupInput{Name: "registration", Strategy: "round_robin", Nodes: []proxyNodeInput{{URL: "http://127.0.0.1:7891"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := &registerService{server: &Server{store: store}, cfg: RegisterConfig{Proxy: "group:" + group.ID}}
+	route, err := svc.resolveRegisterProxy(svc.cfg.Proxy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider, err := svc.createProviderWithProxy(RegisterMailConfig{RequestTimeout: 1, Providers: []map[string]any{{"type": "icloud_api", "enable": true}}}, route.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer provider.Close()
+	ic := provider.(*iCloudAPIRegisterProvider)
+	registerTransport := ic.sess.client.Transport.(*http.Transport)
+	mailTransport := ic.mailSess.client.Transport.(*http.Transport)
+	req, err := http.NewRequest(http.MethodGet, "https://auth.openai.com/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected, err := registerTransport.Proxy(req)
+	if err != nil || selected == nil || selected.String() != route.URL || mailTransport.Proxy != nil {
+		t.Fatalf("registration proxy selected = %v, mail direct = %t, err = %v", selected, mailTransport.Proxy == nil, err)
 	}
 }

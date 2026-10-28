@@ -32,6 +32,14 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		if !readBody(w, r, &body) {
 			return
 		}
+		if raw, ok := body["image_storage"]; ok {
+			settings, err := parseImageStorageSettings(raw)
+			if err != nil {
+				writeErr(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			body["image_storage"] = settings
+		}
 		for k, v := range body {
 			s.cfg.Extra[k] = v
 		}

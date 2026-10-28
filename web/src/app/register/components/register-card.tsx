@@ -24,6 +24,7 @@ import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
+import { fetchProxyGroups, type ProxyGroup } from "@/lib/api";
 
 import { useSettingsStore } from "../../settings/store";
 
@@ -51,10 +52,25 @@ export function RegisterCard() {
   const repairAbnormal = useSettingsStore((state) => state.repairAbnormalRegisterAccounts);
 
   const [configOpen, setConfigOpen] = useState(false);
+  const [proxyGroups, setProxyGroups] = useState<ProxyGroup[]>([]);
+  const [proxySelection, setProxySelection] = useState("direct");
+  const [fixedProxy, setFixedProxy] = useState("");
   const configSectionRef = useRef<HTMLElement | null>(null);
   const logViewportRef = useRef<HTMLDivElement | null>(null);
   const logs = config?.logs || [];
   const failures = config?.failures || [];
+
+  useEffect(() => {
+    if (!config) return;
+    const proxy = config.proxy.trim();
+    if (proxy.startsWith("group:")) setProxySelection(proxy);
+    else if (proxy) { setProxySelection("fixed"); setFixedProxy(proxy); }
+    else setProxySelection((current) => current === "fixed" ? current : "direct");
+  }, [config?.proxy]);
+
+  useEffect(() => {
+    void fetchProxyGroups().then((data) => setProxyGroups(data.groups)).catch(() => setProxyGroups([]));
+  }, []);
 
   // 展开后把整个配置面板的底部滚到视口里。等一帧让 DOM 先渲染完，
   // 否则 scrollIntoView 拿到的是没展开前的位置。
@@ -426,7 +442,19 @@ export function RegisterCard() {
             </div>
             <div className="space-y-1.5">
               <label className="font-data text-[10px] font-semibold tracking-[0.16em] text-muted-foreground uppercase">注册代理</label>
-              <Input value={config.proxy} onChange={(event) => setProxy(event.target.value)} placeholder="http://127.0.0.1:7890" className="h-10 rounded-lg border-border bg-background font-data text-[13px]" disabled={config.enabled} />
+              <Select value={proxySelection} onValueChange={(value) => {
+                setProxySelection(value);
+                setProxy(value === "direct" ? "" : value === "fixed" ? fixedProxy : value);
+              }} disabled={config.enabled}>
+                <SelectTrigger className="h-10 rounded-lg border-border bg-background"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="direct">直连</SelectItem>
+                  <SelectItem value="fixed">固定代理地址</SelectItem>
+                  {proxyGroups.map((group) => <SelectItem key={group.id} value={`group:${group.id}`} disabled={!group.enabled || !group.nodes.some((node) => node.enabled)}>{group.name}（代理组）</SelectItem>)}
+                </SelectContent>
+              </Select>
+              {proxySelection === "fixed" ? <Input value={fixedProxy} onChange={(event) => { setFixedProxy(event.target.value); setProxy(event.target.value); }} placeholder="http://127.0.0.1:7890" className="h-10 rounded-lg border-border bg-background font-data text-[13px]" disabled={config.enabled} /> : null}
+              {proxySelection.startsWith("group:") ? <p className="text-xs text-muted-foreground">每个注册任务选一次节点，任务内保持同一出口。</p> : null}
             </div>
             <div className="space-y-1.5">
               <label className="font-data text-[10px] font-semibold tracking-[0.16em] text-muted-foreground uppercase">目标剩余额度</label>
