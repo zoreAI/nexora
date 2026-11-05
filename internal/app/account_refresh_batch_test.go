@@ -107,7 +107,11 @@ func TestLimitedWatcherRefreshPreservesConcurrentChanges(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.applyLimitedAccountRefresh(observed, Account{Status: "正常", Type: "free", Quota: 4}); err != nil {
+	if err := s.applyAccountInfoRefresh(observed, Account{Status: "正常", Quota: 4}); err == nil {
+		t.Fatal("stale watcher result overwrote concurrent image usage")
+	}
+	observed = store.LoadAccounts()[0]
+	if err := s.applyAccountInfoRefresh(observed, Account{Status: "正常", Type: "free", Quota: 4}); err != nil {
 		t.Fatal(err)
 	}
 	account := store.LoadAccounts()[0]
@@ -121,8 +125,8 @@ func TestLimitedWatcherRefreshPreservesConcurrentChanges(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.applyLimitedAccountRefresh(observed, Account{Status: "正常", Quota: 7}); err != nil {
-		t.Fatal(err)
+	if err := s.applyAccountInfoRefresh(observed, Account{Status: "正常", Quota: 7}); err == nil {
+		t.Fatal("stale watcher result overwrote concurrent rate limit")
 	}
 	account = store.LoadAccounts()[0]
 	if account.Status != "限流" || account.Fail != 2 || account.Quota != 4 {

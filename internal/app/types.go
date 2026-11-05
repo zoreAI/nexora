@@ -37,6 +37,7 @@ type Account struct {
 	Quota             int               `json:"quota"`
 	InitialQuota      int               `json:"initial_quota,omitempty"`
 	ImageQuotaUnknown bool              `json:"image_quota_unknown,omitempty"`
+	QuotaCheckedAt    string            `json:"quota_checked_at,omitempty"`
 	TrialState        string            `json:"trial_state,omitempty"`
 	TrialPromoID      string            `json:"trial_promo_id,omitempty"`
 	TrialPromoLabel   string            `json:"trial_promo_label,omitempty"`

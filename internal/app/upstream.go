@@ -1183,6 +1183,7 @@ func (c *UpstreamClient) GetUserInfo(ctx context.Context) (Account, error) {
 		status = "限流"
 	}
 	acc := Account{AccessToken: c.token, Type: planType, Status: status, SourceType: "web", Quota: quota, ImageQuotaUnknown: quotaUnknown, LimitsProgress: limits, TrialState: trialState, TrialPromoID: trialPromoID, TrialPromoLabel: trialPromoLabel, TrialCheckedAt: nowISO()}
+	acc.QuotaCheckedAt = nowISO()
 	if e := strAny(me["email"], ""); e != "" {
 		acc.Email = &e
 	}

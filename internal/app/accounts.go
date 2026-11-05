@@ -437,6 +437,9 @@ func mergeAccount(dst *Account, src Account) {
 		dst.TrialPromoLabel = src.TrialPromoLabel
 		dst.TrialCheckedAt = src.TrialCheckedAt
 	}
+	if src.QuotaCheckedAt != "" {
+		dst.QuotaCheckedAt = src.QuotaCheckedAt
+	}
 	if src.SourceType != "" {
 		dst.SourceType = src.SourceType
 	}
@@ -513,12 +516,16 @@ func mergeRefreshedAccount(dst *Account, info Account) {
 	} else if status == "限流" {
 		if info.Status == "正常" && !info.ImageQuotaUnknown && info.Quota > 0 {
 			dst.Status = "正常"
-			dst.RestoreAt = nil
+			dst.RestoreAt = info.RestoreAt
 			dst.RateLimitedAt = nil
-			dst.RateLimitResetAt = nil
+			dst.RateLimitResetAt = info.RateLimitResetAt
 		} else {
 			dst.Status = "限流"
 		}
+	} else if info.Status == "正常" {
+		dst.ImageQuotaUnknown = info.ImageQuotaUnknown
+		dst.RestoreAt = info.RestoreAt
+		dst.RateLimitResetAt = info.RateLimitResetAt
 	}
 }
 
@@ -724,7 +731,13 @@ func (s *Server) applyAccountInfoRefresh(observed, info Account) error {
 			if current[i].AccessToken != observed.AccessToken {
 				continue
 			}
-			if current[i].Success != observed.Success || current[i].Fail != observed.Fail || current[i].Status != observed.Status {
+			if current[i].Success != observed.Success || current[i].Fail != observed.Fail || current[i].Status != observed.Status ||
+				current[i].Quota != observed.Quota || current[i].ImageQuotaUnknown != observed.ImageQuotaUnknown ||
+				current[i].QuotaCheckedAt != observed.QuotaCheckedAt ||
+				ptrString(current[i].RefreshToken) != ptrString(observed.RefreshToken) ||
+				ptrString(current[i].RateLimitedAt) != ptrString(observed.RateLimitedAt) ||
+				ptrString(current[i].RateLimitResetAt) != ptrString(observed.RateLimitResetAt) ||
+				ptrString(current[i].RestoreAt) != ptrString(observed.RestoreAt) {
 				stale = true
 				break
 			}

@@ -75,6 +75,10 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		if v, ok := body["refresh_account_interval_minute"]; ok {
 			s.cfg.RefreshAccountIntervalMinute = intAny(v, s.cfg.RefreshAccountIntervalMinute)
+			if s.cfg.RefreshAccountIntervalMinute <= 0 {
+				s.cfg.RefreshAccountIntervalMinute = int(defaultAccountRefreshInterval / time.Minute)
+			}
+			s.setAccountQuotaRefreshInterval(s.cfg.RefreshAccountIntervalMinute)
 		}
 		if v, ok := body["image_retention_days"]; ok {
 			s.cfg.ImageRetentionDays = intAny(v, s.cfg.ImageRetentionDays)

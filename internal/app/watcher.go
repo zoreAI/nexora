@@ -3,67 +3,95 @@ package app
 import (
 	"context"
 	"log"
+	"strings"
 	"time"
 )
 
+const defaultAccountRefreshInterval = 5 * time.Minute
+
 func (s *Server) startLimitedAccountWatcher() {
-	interval := time.Duration(s.cfg.RefreshAccountIntervalMinute) * time.Minute
-	if interval <= 0 {
-		interval = 60 * time.Minute
-	}
-	go func() {
-		for {
-			time.Sleep(interval)
-			accounts := s.store.LoadAccounts()
-			var limited []Account
-			for _, a := range accounts {
-				if a.Status == "限流" && a.AccessToken != "" {
-					limited = append(limited, a)
-				}
-			}
-			if len(limited) == 0 {
-				continue
-			}
-			log.Printf("[account-limited-watcher] checking %d limited accounts", len(limited))
-			for _, observed := range limited {
-				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-				release, err := s.acquireAccountRefreshSlot(ctx)
-				if err != nil {
-					cancel()
-					continue
-				}
-				client, err := s.newUpstreamClientForAccount(observed)
-				if err != nil {
-					release()
-					cancel()
-					continue
-				}
-				info, err := client.GetUserInfo(ctx)
-				release()
-				cancel()
-				if err != nil {
-					continue
-				}
-				if err := s.applyLimitedAccountRefresh(observed, info); err != nil {
-					log.Printf("[account-limited-watcher] update failed: %v", err)
-				}
-			}
-		}
-	}()
+	s.quotaRefreshChanged = make(chan struct{}, 1)
+	s.setAccountQuotaRefreshInterval(s.cfg.RefreshAccountIntervalMinute)
+	initial := s.store.LoadAccounts()
+	go s.runAccountQuotaWatcher(context.Background(), initial, s.refreshAccountInfo)
 }
 
-func (s *Server) applyLimitedAccountRefresh(observed, info Account) error {
-	return s.store.UpdateAccounts(func(current []Account) []Account {
-		for i := range current {
-			if current[i].AccessToken != observed.AccessToken || current[i].Status != "限流" {
-				continue
-			}
-			if current[i].Fail != observed.Fail || ptrString(current[i].RateLimitedAt) != ptrString(observed.RateLimitedAt) {
-				break
-			}
-			mergeRefreshedAccount(&current[i], info)
-			break
+func (s *Server) runAccountQuotaWatcher(ctx context.Context, accounts []Account, refresh func(context.Context, Account) error) {
+	for ctx.Err() == nil {
+		s.refreshAccountQuotas(ctx, accounts, time.Now(), refresh)
+		s.waitForAccountQuotaRefresh(ctx)
+		if ctx.Err() == nil {
+			accounts = s.store.LoadAccounts()
 		}
-		return current
-	})
+	}
+}
+
+func (s *Server) setAccountQuotaRefreshInterval(minutes int) {
+	interval := time.Duration(minutes) * time.Minute
+	if interval <= 0 {
+		interval = defaultAccountRefreshInterval
+	}
+	s.quotaRefreshInterval.Store(int64(interval))
+	select {
+	case s.quotaRefreshChanged <- struct{}{}:
+	default:
+	}
+}
+
+func (s *Server) waitForAccountQuotaRefresh(ctx context.Context) {
+	interval := func() time.Duration {
+		if d := time.Duration(s.quotaRefreshInterval.Load()); d > 0 {
+			return d
+		}
+		return defaultAccountRefreshInterval
+	}
+	timer := time.NewTimer(interval())
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			return
+		case <-s.quotaRefreshChanged:
+			timer.Reset(interval())
+		}
+	}
+}
+
+func accountQuotaRefreshDue(a Account, now time.Time) bool {
+	if strings.TrimSpace(a.AccessToken) == "" || (a.Status != "正常" && a.Status != "限流") {
+		return false
+	}
+	if a.Status == "限流" || (!a.ImageQuotaUnknown && a.Quota <= 0) {
+		return true
+	}
+	for _, reset := range []string{ptrString(a.RateLimitResetAt), ptrString(a.RestoreAt)} {
+		if at, err := parseAccountTime(reset); err == nil && !now.Before(at) {
+			return true
+		}
+	}
+	checkedAt, err := parseAccountTime(a.QuotaCheckedAt)
+	return err != nil || !now.Before(checkedAt.Add(24*time.Hour))
+}
+
+func (s *Server) refreshAccountQuotas(ctx context.Context, accounts []Account, now time.Time, refresh func(context.Context, Account) error) {
+	var selected []Account
+	for _, a := range accounts {
+		if accountQuotaRefreshDue(a, now) {
+			selected = append(selected, a)
+		}
+	}
+	if len(selected) == 0 {
+		return
+	}
+	log.Printf("[account-quota-watcher] checking %d accounts", len(selected))
+	results := runAccountRefreshBatch(ctx, selected, refresh)
+	failed := 0
+	for _, err := range results {
+		if err != nil {
+			failed++
+		}
+	}
+	log.Printf("[account-quota-watcher] refreshed=%d failed=%d", len(selected)-failed, failed)
 }

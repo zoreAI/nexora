@@ -49,7 +49,7 @@
     "warning"
   ],
   "proxy": "http://127.0.0.1:7897",
-  "refresh_account_interval_minute": 60,
+  "refresh_account_interval_minute": 5,
   "sensitive_words": [],
   "sentinel_solver_url": ""
 }

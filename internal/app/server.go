@@ -10,38 +10,41 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 type Server struct {
-	root                string
-	dataDir             string
-	imagesDir           string
-	webDist             string
-	cfg                 Config
-	store               *Store
-	mux                 *http.ServeMux
-	accMu               sync.Mutex
-	authMu              sync.Mutex
-	taskMu              sync.Mutex
-	galleryMu           sync.Mutex
-	logMu               sync.Mutex
-	imageCleanupMu      sync.Mutex
-	imageStorageMu      sync.Mutex
-	lastImageCleanup    time.Time
-	proxyCursor         uint64
-	imageEgressMu       sync.Mutex
-	imageEgressInflight map[string]int
-	imageEgressNotify   chan struct{}
-	callStarts          map[string]time.Time
-	taskCancels         map[imageTaskKey]context.CancelFunc
-	taskRunnerOnce      sync.Once
-	imageTasks          *imageTaskRunner
-	accountPool         *accountPool
-	accountRefreshJobs  accountRefreshJobs
-	accountRepairJobs   accountRefreshJobs
-	logSvc              *logService
-	register            *registerService
+	root                 string
+	dataDir              string
+	imagesDir            string
+	webDist              string
+	cfg                  Config
+	store                *Store
+	mux                  *http.ServeMux
+	accMu                sync.Mutex
+	authMu               sync.Mutex
+	taskMu               sync.Mutex
+	galleryMu            sync.Mutex
+	logMu                sync.Mutex
+	imageCleanupMu       sync.Mutex
+	imageStorageMu       sync.Mutex
+	lastImageCleanup     time.Time
+	proxyCursor          uint64
+	imageEgressMu        sync.Mutex
+	imageEgressInflight  map[string]int
+	imageEgressNotify    chan struct{}
+	callStarts           map[string]time.Time
+	taskCancels          map[imageTaskKey]context.CancelFunc
+	taskRunnerOnce       sync.Once
+	imageTasks           *imageTaskRunner
+	accountPool          *accountPool
+	accountRefreshJobs   accountRefreshJobs
+	accountRepairJobs    accountRefreshJobs
+	quotaRefreshInterval atomic.Int64
+	quotaRefreshChanged  chan struct{}
+	logSvc               *logService
+	register             *registerService
 }
 
 func NewServer(root string) (*Server, error) {
@@ -62,7 +65,7 @@ func NewServer(root string) (*Server, error) {
 		}
 	}
 	if cfg.RefreshAccountIntervalMinute <= 0 {
-		cfg.RefreshAccountIntervalMinute = 60
+		cfg.RefreshAccountIntervalMinute = int(defaultAccountRefreshInterval / time.Minute)
 	}
 	if cfg.ImageRetentionDays <= 0 {
 		cfg.ImageRetentionDays = 15
