@@ -31,6 +31,7 @@ const nextConfig: NextConfig = {
     typescript: {
         ignoreBuildErrors: true,
     },
+    ...(isDevelopment ? { experimental: { proxyTimeout: 300_000 } } : {}),
     ...(isDevelopment ? {
         async rewrites() {
             const backend = process.env.NEXT_PUBLIC_DEV_BACKEND || 'http://127.0.0.1:3000'

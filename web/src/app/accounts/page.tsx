@@ -55,6 +55,7 @@ import {
   fetchModels,
   fetchProxyGroups,
   loginAbnormalAccountWithMFA,
+  setupAccountMFA,
   startAccountRefresh,
   startAccountRepair,
   updateAccount,
@@ -65,6 +66,7 @@ import {
   type AccountRefreshProgress,
   type AccountStatus,
   type Model,
+  type PendingRegisterAccount,
   type ProxyGroup,
 } from "@/lib/api";
 import { useAuthGuard } from "@/lib/use-auth-guard";
@@ -72,6 +74,13 @@ import { cn } from "@/lib/utils";
 
 import { AccountImportDialog } from "./components/account-import-dialog";
 import { AccountGroupsDialog } from "./components/account-groups-dialog";
+import { CodexAuthBatchDialog } from "./components/codex-auth-batch-dialog";
+import { PendingRegistration } from "./components/pending-registration";
+
+type AccountRow = Account | PendingRegisterAccount;
+function isPendingRow(row: AccountRow): row is PendingRegisterAccount {
+  return !("access_token" in row);
+}
 
 const accountStatusOptions: { label: string; value: AccountStatus | "all" }[] = [
   { label: "全部状态", value: "all" },
@@ -253,33 +262,29 @@ const STATUS_BADGE_CLASS: Record<AccountStatus, string> = {
   禁用: "border-stone-200 bg-stone-100 text-stone-600",
 };
 
-function quotaUpperBound(account: Account) {
-  // 优先用注册时拿到的总额度（后端 _normalize_account 维护）；
-  // 兜底：按类型估（Plus 50 / 其他 25），主要用于历史数据还没来得及补 initial_quota 的场景。
-  const initial = Math.max(0, Math.floor(account.initial_quota ?? 0));
-  if (initial > 0) return initial;
-  return displayAccountType(account) === "Plus" ? 50 : 25;
+function quotaReferenceBaseline(account: Account) {
+  const baseline = account.image_quota_baseline;
+  return typeof baseline === "number" && Number.isFinite(baseline) && baseline >= 0
+    ? Math.max(baseline, account.quota)
+    : Math.max(0, account.quota);
 }
 
-function PillProgress({
-  percent,
-  segments = 15,
-}: {
-  percent: number;
-  segments?: number;
-}) {
+function accountWindowStats(account: Account, now: number) {
+  if (!account.window_started_at) return null;
+  const resetAt = account.window_reset_at ? Date.parse(account.window_reset_at) : NaN;
+  if (Number.isFinite(resetAt) && now >= resetAt) {
+    return { success: 0, fail: 0 };
+  }
+  return { success: Math.max(0, account.window_success ?? 0), fail: Math.max(0, account.window_fail ?? 0) };
+}
+
+function PillProgress({ percent, segments = 15 }: { percent: number; segments?: number }) {
   const clamped = Math.max(0, Math.min(100, percent));
   const filled = Math.round((clamped / 100) * segments);
   return (
-    <div className="flex gap-[3px]" aria-label={`${clamped}%`}>
+    <div className="flex gap-[3px]" role="progressbar" aria-label="参考剩余额度" aria-valuemin={0} aria-valuemax={100} aria-valuenow={clamped}>
       {Array.from({ length: segments }).map((_, i) => (
-        <span
-          key={i}
-          className={cn(
-            "h-2 flex-1 rounded-full transition-colors",
-            i < filled ? "bg-emerald-500" : "bg-amber-400/75",
-          )}
-        />
+        <span key={i} className={cn("h-2 flex-1 rounded-full transition-colors", i < filled ? "bg-emerald-500" : "bg-amber-400/75")} />
       ))}
     </div>
   );
@@ -315,38 +320,42 @@ function HealthPills({
 
 function AccountCard({
   account,
+  statsNow,
   proxyLabel,
   selected,
   onSelectChange,
   onEdit,
   onRefresh,
   onMFALogin,
+  onMFASetup,
   onToggleStatus,
   onDelete,
   onCopyToken,
-  onCopyPassword,
-  onCopyMFA,
+  onCopyCredentials,
   onCopyMFACode,
   isRefreshing,
   isMFALoggingIn,
+  isMFASettingUp,
   isDeleting,
   isUpdating,
 }: {
   account: Account;
+  statsNow: number;
   proxyLabel: string;
   selected: boolean;
   onSelectChange: (v: boolean) => void;
   onEdit: () => void;
   onRefresh: () => void;
   onMFALogin: () => void;
+  onMFASetup: () => void;
   onToggleStatus: () => void;
   onDelete: () => void;
   onCopyToken: () => void;
-  onCopyPassword: () => void;
-  onCopyMFA: () => void;
+  onCopyCredentials: () => void;
   onCopyMFACode: () => void;
   isRefreshing: boolean;
   isMFALoggingIn: boolean;
+  isMFASettingUp: boolean;
   isDeleting: boolean;
   isUpdating: boolean;
 }) {
@@ -355,13 +364,10 @@ function AccountCard({
   const typeAvatar = (typeName[0] || "?").toUpperCase();
   const isUnlimited = isUnlimitedImageQuotaAccount(account);
   const isUnknown = imageQuotaUnknown(account);
-  const maxQuota = quotaUpperBound(account);
-  const remainingPct = isUnlimited
-    ? 100
-    : isUnknown
-      ? 0
-      : Math.max(0, Math.min(100, Math.round((account.quota / maxQuota) * 100)));
+  const maxQuota = quotaReferenceBaseline(account);
+  const remainingPct = isUnlimited ? 100 : isUnknown || maxQuota === 0 ? 0 : Math.max(0, Math.min(100, Math.round((account.quota / maxQuota) * 100)));
   const restore = formatRestoreAt(account.restore_at);
+  const windowStats = accountWindowStats(account, statsNow);
 
   return (
     <div
@@ -420,16 +426,10 @@ function AccountCard({
           <span>Token</span>
           <span className="font-data text-foreground/80">{maskToken(account.access_token)}</span>
         </span>
-        {account.password ? (
-          <button type="button" onClick={onCopyPassword} title="复制登录密码" className="inline-flex items-center gap-1 hover:text-foreground">
-            <Copy className="size-3" /> 密码
-          </button>
-        ) : null}
-        {account.mfa_secret ? (
-          <button type="button" onClick={onCopyMFA} title="复制 2FA 密钥" className="inline-flex items-center gap-1 hover:text-foreground">
-            <Copy className="size-3" /> 2FA 密钥
-          </button>
-        ) : null}
+        {account.password ? <span>密码已保存</span> : null}
+        <button type="button" onClick={onCopyCredentials} title="复制账号----密码----2FA 密钥" className="inline-flex items-center gap-1 hover:text-foreground">
+          <Copy className="size-3" /> 复制账号凭据
+        </button>
         {account.mfa_status === "enabled" ? (
           <button type="button" onClick={onCopyMFACode} title="复制当前 2FA 验证码" className="inline-flex items-center gap-1 hover:text-foreground">
             <KeyRound className="size-3" /> 验证码
@@ -443,24 +443,24 @@ function AccountCard({
         ) : null}
       </div>
 
-      <div className="mt-2.5 flex items-center gap-3 text-xs">
+      <div className="mt-2.5 flex items-center gap-3 text-xs" title="当前额度窗口内的调用统计">
         <span className="inline-flex items-center gap-1">
           <span className="size-1.5 rounded-full bg-emerald-500" />
           <span className="text-muted-foreground">成功</span>
-          <span className="font-data tabular-nums font-semibold text-emerald-600">{account.success}</span>
+          <span className="font-data tabular-nums font-semibold text-emerald-600">{windowStats?.success ?? "—"}</span>
         </span>
         <span className="inline-flex items-center gap-1">
           <span className="size-1.5 rounded-full bg-rose-500" />
           <span className="text-muted-foreground">失败</span>
-          <span className="font-data tabular-nums font-semibold text-rose-500">{account.fail}</span>
+          <span className="font-data tabular-nums font-semibold text-rose-500">{windowStats?.fail ?? "—"}</span>
         </span>
       </div>
 
       <div className="mt-3 space-y-1.5">
-        <div className="font-data text-[10px] font-semibold tracking-[0.18em] uppercase text-muted-foreground">
+        <div className="font-data text-[10px] font-semibold tracking-[0.18em] uppercase text-muted-foreground" title="按当前额度窗口内的成功和失败次数计算">
           健康状态
         </div>
-        <HealthPills success={account.success} fail={account.fail} />
+        <HealthPills success={windowStats?.success ?? 0} fail={windowStats?.fail ?? 0} />
       </div>
 
       <div className="mt-3 space-y-1.5">
@@ -474,16 +474,15 @@ function AccountCard({
             ) : isUnknown ? (
               <span className="text-muted-foreground">未知</span>
             ) : (
-              <>
+              <span title="参考百分比：以同一重置窗口内读取到的最高剩余次数为基准；上游未提供真实总额度。">
                 <span className="font-semibold text-foreground">{remainingPct}%</span>
-                <span className="ml-1 text-muted-foreground">
-                  {account.quota}/{maxQuota}
-                </span>
-              </>
+                <span className="mx-1 text-muted-foreground">·</span>
+                <span className="text-muted-foreground">{account.quota}/{maxQuota}</span>
+              </span>
             )}
           </span>
         </div>
-        <PillProgress percent={remainingPct} />
+        {!isUnknown || isUnlimited ? <PillProgress percent={remainingPct} /> : null}
       </div>
 
       <div className="mt-4 flex items-center gap-0.5 border-t border-border/60 pt-2.5 text-muted-foreground">
@@ -516,6 +515,11 @@ function AccountCard({
         {account.status === "异常" && account.mfa_secret ? (
           <button type="button" className="cursor-pointer rounded-md p-1.5 transition hover:bg-secondary hover:text-foreground disabled:opacity-50" onClick={onMFALogin} disabled={isMFALoggingIn || !account.email || !account.password} title={!account.email || !account.password ? "缺少邮箱或登录密码" : "使用密码和 2FA 尝试登录"} aria-label="使用密码和 2FA 尝试登录">
             {isMFALoggingIn ? <LoaderCircle className="size-4 animate-spin" /> : <LogIn className="size-4" />}
+          </button>
+        ) : null}
+        {(account.mfa_status === "failed" || account.mfa_status === "pending") ? (
+          <button type="button" className="cursor-pointer rounded-md p-1.5 transition hover:bg-secondary hover:text-foreground disabled:opacity-50" onClick={onMFASetup} disabled={isMFASettingUp} title="补设验证器 2FA" aria-label="补设验证器 2FA">
+            {isMFASettingUp ? <LoaderCircle className="size-4 animate-spin" /> : <KeyRound className="size-4" />}
           </button>
         ) : null}
         <button
@@ -552,10 +556,17 @@ function AccountsPageContent() {
   // 命中模块级缓存时直接拿来当初始 state，避免再次切到号池页时
   // accounts 从 [] 起跳、isLoading=true 让大表格塌缩成 spinner 再撑回。
   const [accounts, setAccountsState] = useState<Account[]>(() => cachedAccounts ?? []);
+  const [statsNow, setStatsNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = window.setInterval(() => setStatsNow(Date.now()), 30_000);
+    return () => window.clearInterval(timer);
+  }, []);
   const [availableModels, setAvailableModels] = useState<Model[]>([]);
   const [isLoadingModels, setIsLoadingModels] = useState(true);
   const [modelsError, setModelsError] = useState("");
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [pendingRegistrations, setPendingRegistrations] = useState<PendingRegisterAccount[]>([]);
+  const [selectedPendingEmails, setSelectedPendingEmails] = useState<string[]>([]);
   const [query, setQuery] = useState("");
   const [typeFilter, setTypeFilter] = useState("all");
   const [statusFilter, setStatusFilter] = useState<AccountStatus | "all">("all");
@@ -568,12 +579,15 @@ function AccountsPageContent() {
   const [proxyGroups, setProxyGroups] = useState<ProxyGroup[]>([]);
   const [accountGroups, setAccountGroups] = useState<AccountGroup[]>([]);
   const [editAccountGroupID, setEditAccountGroupID] = useState("");
+  const [editPassword, setEditPassword] = useState("");
+  const [editMFASecret, setEditMFASecret] = useState("");
   const [editProxyMode, setEditProxyMode] = useState<"inherit" | "direct" | "group" | "custom">("inherit");
   const [editProxyGroupID, setEditProxyGroupID] = useState("");
   const [editProxyURL, setEditProxyURL] = useState("");
   const [isLoading, setIsLoading] = useState(() => cachedAccounts === null);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [mfaLoginToken, setMFALoginToken] = useState<string | null>(null);
+  const [mfaSetupToken, setMFASetupToken] = useState<string | null>(null);
   const [refreshProgress, setRefreshProgress] = useState<AccountRefreshProgress | null>(null);
   const [activeRefreshId, setActiveRefreshId] = useState<string | null>(null);
   const [repairProgress, setRepairProgress] = useState<AccountRefreshProgress | null>(null);
@@ -604,13 +618,12 @@ function AccountsPageContent() {
     }
   };
 
-  const copyPassword = async (account: Account) => {
-    if (!account.password) return;
+  const copyCredentials = async (account: Account) => {
     try {
-      await navigator.clipboard.writeText(account.password);
-      toast.success("登录密码已复制");
+      await navigator.clipboard.writeText(`${account.email ?? ""}----${account.password ?? ""}----${account.mfa_secret ?? ""}`);
+      toast.success("账号凭据已复制");
     } catch {
-      toast.error("复制密码失败，请检查浏览器剪贴板权限");
+      toast.error("复制账号凭据失败，请检查浏览器剪贴板权限");
     }
   };
 
@@ -727,6 +740,9 @@ function AccountsPageContent() {
       const data = await fetchAccounts();
       if (version !== accountsLoadVersionRef.current) return;
       setAccounts(data.items);
+      const pending = data.pending_registrations ?? [];
+      setPendingRegistrations(pending);
+      setSelectedPendingEmails((prev) => prev.filter((email) => pending.some((item) => item.email === email)));
       setSelectedIds((prev) => prev.filter((id) => data.items.some((item) => item.access_token === id)));
     } catch (error) {
       if (version !== accountsLoadVersionRef.current) return;
@@ -788,7 +804,7 @@ function AccountsPageContent() {
     void fetchAccountGroups().then((data) => setAccountGroups(data.groups)).catch(() => toast.error("加载账号组失败"));
   }, []);
 
-  const filteredAccounts = useMemo(() => {
+  const filteredPoolAccounts = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
     return accounts.filter((account) => {
       const searchMatched = normalizedQuery.length === 0 || [
@@ -808,31 +824,44 @@ function AccountsPageContent() {
     });
   }, [accounts, query, statusFilter, typeFilter, trialFilter, groupFilter]);
 
+  const filteredAccounts = useMemo<AccountRow[]>(() => {
+    const normalizedQuery = query.trim().toLowerCase();
+    const pending = pendingRegistrations.filter((item) =>
+      (statusFilter === "all" || statusFilter === "异常") &&
+      (typeFilter === "all" || typeFilter === "注册未完成") &&
+      (trialFilter === "all" || trialFilter === "unknown") &&
+      (groupFilter === "all" || groupFilter === "none") &&
+      (!normalizedQuery || [item.email, item.state, "注册未完成"].some((value) => value.toLowerCase().includes(normalizedQuery)))
+    );
+    return [...pending, ...filteredPoolAccounts];
+  }, [filteredPoolAccounts, pendingRegistrations, query, statusFilter, typeFilter, trialFilter, groupFilter]);
+
   const pageCount = Math.max(1, Math.ceil(filteredAccounts.length / Number(pageSize)));
   const safePage = Math.min(page, pageCount);
   const startIndex = (safePage - 1) * Number(pageSize);
   const currentRows = filteredAccounts.slice(startIndex, startIndex + Number(pageSize));
   const allCurrentSelected =
-    currentRows.length > 0 && currentRows.every((row) => selectedIds.includes(row.access_token));
+    currentRows.length > 0 && currentRows.every((row) => isPendingRow(row) ? selectedPendingEmails.includes(row.email) : selectedIds.includes(row.access_token));
 
   const summary = useMemo(() => {
-    const total = accounts.length;
+    const total = accounts.length + pendingRegistrations.length;
     const active = accounts.filter((item) => item.status === "正常").length;
     const limited = accounts.filter((item) => item.status === "限流").length;
-    const abnormal = accounts.filter((item) => item.status === "异常").length;
+    const abnormal = accounts.filter((item) => item.status === "异常").length + pendingRegistrations.length;
     const banned = accounts.filter((item) => item.status === "封号").length;
     const disabled = accounts.filter((item) => item.status === "禁用").length;
     const quota = formatQuotaSummary(accounts);
 
     return { total, active, limited, abnormal, banned, disabled, quota };
-  }, [accounts]);
+  }, [accounts, pendingRegistrations]);
 
   const accountTypeOptions = useMemo(
     () => [
       { label: "全部类型", value: "all" },
+      ...(pendingRegistrations.length ? [{ label: "注册未完成", value: "注册未完成" }] : []),
       ...Array.from(new Set(accounts.map(displayAccountType))).map((type) => ({ label: type, value: type })),
     ],
-    [accounts],
+    [accounts, pendingRegistrations],
   );
 
   const selectedTokens = useMemo(() => {
@@ -846,6 +875,8 @@ function AccountsPageContent() {
   }, [accounts, selectedIds]);
 
   const selectedAbnormalTokens = useMemo(() => selectedAccounts.filter((item) => item.status === "异常").map((item) => item.access_token), [selectedAccounts]);
+
+  const refreshAllTokens = useMemo(() => accounts.filter((item) => item.status !== "异常" && item.status !== "封号").map((item) => item.access_token), [accounts]);
 
   const abnormalTokens = useMemo(() => {
     return accounts.filter((item) => item.status === "异常").map((item) => item.access_token);
@@ -917,17 +948,30 @@ function AccountsPageContent() {
     }
   };
 
-  const handleRepairSelected = async () => {
-    if (selectedAbnormalTokens.length === 0 || activeRepairId || isStartingRepair) return;
-    const requestedCount = selectedAbnormalTokens.length;
+  const handleMFASetup = async (account: Account) => {
+    setMFASetupToken(account.access_token);
+    try {
+      await setupAccountMFA(account.access_token);
+      toast.success(`${account.email} 2FA 已启用`);
+      await loadAccounts(true, true);
+    } catch (error) {
+      toast.error(`${account.email} 2FA 设置失败：${error instanceof Error ? error.message : "未知错误"}`);
+    } finally {
+      setMFASetupToken(null);
+    }
+  };
+
+  const handleRepairSelected = async (tokens = selectedAbnormalTokens, recoveryEmails = selectedPendingEmails, retryBlocked = false) => {
+    if (tokens.length + recoveryEmails.length === 0 || activeRepairId || isStartingRepair) return;
+    const requestedCount = tokens.length + recoveryEmails.length;
     setIsStartingRepair(true);
     setRepairProgress(null);
     try {
-      const started = await startAccountRepair(selectedAbnormalTokens);
+      const started = await startAccountRepair(tokens, recoveryEmails, retryBlocked);
       window.sessionStorage.setItem("accounts.repairProgressId", started.progress_id);
       setActiveRepairId(started.progress_id);
       const count = typeof started.total === "number" && Number.isFinite(started.total) ? started.total : requestedCount;
-      toast.success(`已启动 ${count} 个异常账号的修复`);
+      toast.success(`已启动 ${count} 个异常账号的修复${started.skipped ? `，跳过 ${started.skipped} 个需人工处理的记录` : ""}`);
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "启动修复失败");
     } finally {
@@ -939,6 +983,8 @@ function AccountsPageContent() {
     setEditingAccount(account);
     setEditStatus(account.status);
     setEditAccountGroupID(account.group_id ?? "");
+    setEditPassword("");
+    setEditMFASecret("");
     const assignment = account.proxy?.trim() ?? "";
     setEditProxyMode(!assignment ? "inherit" : assignment === "direct" ? "direct" : assignment.startsWith("group:") ? "group" : "custom");
     setEditProxyGroupID(assignment.startsWith("group:") ? assignment.slice(6) : "");
@@ -965,6 +1011,8 @@ function AccountsPageContent() {
         status: editStatus,
         group_id: editAccountGroupID,
         proxy,
+        ...(editPassword !== "" ? { password: editPassword } : {}),
+        ...(editMFASecret.trim() !== "" ? { mfa_secret: editMFASecret.trim() } : {}),
       });
       setAccounts(data.items);
       setSelectedIds((prev) => prev.filter((id) => data.items.some((item) => item.access_token === id)));
@@ -1008,13 +1056,20 @@ function AccountsPageContent() {
     }
   };
 
-  const toggleSelectAll = (checked: boolean) => {
-    if (checked) {
-      setSelectedIds((prev) => Array.from(new Set([...prev, ...currentRows.map((item) => item.access_token)])));
-      return;
-    }
-    setSelectedIds((prev) => prev.filter((id) => !currentRows.some((row) => row.access_token === id)));
+  const selectRows = (rows: AccountRow[], checked: boolean) => {
+    const tokens = rows.flatMap((row) => isPendingRow(row) ? [] : [row.access_token]);
+    const emails = rows.flatMap((row) => isPendingRow(row) ? [row.email] : []);
+    setSelectedIds((prev) => checked ? Array.from(new Set([...prev, ...tokens])) : prev.filter((id) => !tokens.includes(id)));
+    setSelectedPendingEmails((prev) => checked ? Array.from(new Set([...prev, ...emails])) : prev.filter((email) => !emails.includes(email)));
   };
+  const toggleSelectAll = (checked: boolean) => selectRows(currentRows, checked);
+  const pendingRow = (item: PendingRegisterAccount, layout: "list" | "grid") => <PendingRegistration
+    key={`pending:${item.email.toLowerCase()}`} item={item} layout={layout}
+    selected={selectedPendingEmails.includes(item.email)}
+    onSelect={(checked) => selectRows([item], checked)}
+    busy={activeRepairId !== null || isStartingRepair}
+    onRepair={() => void handleRepairSelected([], [item.email], true)}
+  />;
 
   return (
     <>
@@ -1086,14 +1141,23 @@ function AccountsPageContent() {
       ) : null}
 
       <Dialog open={Boolean(editingAccount)} onOpenChange={(open) => (!open ? setEditingAccount(null) : null)}>
-        <DialogContent showCloseButton={false} className="rounded-2xl p-6">
+        <DialogContent showCloseButton={false} className="max-h-[85vh] overflow-y-auto rounded-2xl p-6">
           <DialogHeader className="gap-2">
             <DialogTitle>编辑账户</DialogTitle>
             <DialogDescription className="text-sm leading-6">
-              修改账号状态和上游出口。
+              修改账号状态、上游出口和登录凭据。
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-4">
+            <div className="space-y-2">
+              <label htmlFor="account-login-password" className="text-sm font-medium text-stone-700">登录密码</label>
+              <Input id="account-login-password" type="password" value={editPassword} onChange={(event) => setEditPassword(event.target.value)} placeholder={editingAccount?.password ? "已保存，留空不修改" : "输入登录密码"} autoComplete="new-password" />
+            </div>
+            <div className="space-y-2">
+              <label htmlFor="account-mfa-secret" className="text-sm font-medium text-stone-700">2FA 密钥</label>
+              <Input id="account-mfa-secret" type="password" value={editMFASecret} onChange={(event) => setEditMFASecret(event.target.value)} placeholder={editingAccount?.mfa_secret ? "已保存，留空不修改" : "输入验证器密钥"} autoComplete="off" spellCheck={false} />
+              <p className="text-xs text-muted-foreground">填写已在账号上启用的验证器密钥；保存密钥不会替你开启 2FA。</p>
+            </div>
             <div className="space-y-2">
               <label className="text-sm font-medium text-stone-700">账号组</label>
               <Select value={editAccountGroupID || "none"} onValueChange={(value) => setEditAccountGroupID(value === "none" ? "" : value)}>
@@ -1327,8 +1391,11 @@ function AccountsPageContent() {
               setAccounts(items);
               setSelectedIds([]);
               setPage(1);
+              void loadAccounts(true);
             }}
           />
+          <CodexAuthBatchDialog disabled={showProgress} />
+          <CodexAuthBatchDialog disabled={showProgress} mode="web" />
           <AccountGroupsDialog groups={accountGroups} proxyGroups={proxyGroups} accounts={accounts} onChanged={async () => { const data = await fetchAccountGroups(); setAccountGroups(data.groups); }} />
           <Popover open={groupMenuOpen} onOpenChange={setGroupMenuOpen}>
             <PopoverTrigger asChild>
@@ -1363,30 +1430,30 @@ function AccountsPageContent() {
             {isRefreshing ? <LoaderCircle className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
             刷新选中
           </Button>
-          <Button variant="outline" className="h-9 rounded-md" onClick={() => void handleRefreshAccounts(accounts.map((item) => item.access_token))} disabled={showProgress || accounts.length === 0}>
+          <Button variant="outline" className="h-9 rounded-md" title="刷新全部账号，跳过异常和封号账号" onClick={() => void handleRefreshAccounts(refreshAllTokens)} disabled={showProgress || refreshAllTokens.length === 0}>
             <RefreshCw className="size-4" />
             刷新全部
           </Button>
           <Popover>
             <PopoverTrigger asChild>
-              <Button variant="outline" className="h-9 rounded-md" disabled={accounts.length === 0}>
+              <Button variant="outline" className="h-9 rounded-md" disabled={accounts.length + pendingRegistrations.length === 0}>
                 <MoreHorizontal className="size-4" />
                 批量处理
               </Button>
             </PopoverTrigger>
             <PopoverContent align="start" className="w-56 rounded-md border-border p-1">
-              <button type="button" onClick={() => setSelectedIds(accounts.map((item) => item.access_token))} className="w-full rounded-sm px-3 py-2 text-left text-sm hover:bg-secondary">全选账号</button>
-              <button type="button" onClick={() => setSelectedIds((prev) => Array.from(new Set([...prev, ...filteredAccounts.map((item) => item.access_token)])))} className="w-full rounded-sm px-3 py-2 text-left text-sm hover:bg-secondary">全选筛选结果</button>
-              <button type="button" disabled={selectedIds.length === 0} onClick={() => setSelectedIds([])} className="w-full rounded-sm px-3 py-2 text-left text-sm hover:bg-secondary disabled:opacity-40">取消选择</button>
+              <button type="button" onClick={() => { setSelectedIds(accounts.map((item) => item.access_token)); setSelectedPendingEmails(pendingRegistrations.map((item) => item.email)); }} className="w-full rounded-sm px-3 py-2 text-left text-sm hover:bg-secondary">全选账号</button>
+              <button type="button" onClick={() => selectRows(filteredAccounts, true)} className="w-full rounded-sm px-3 py-2 text-left text-sm hover:bg-secondary">全选筛选结果</button>
+              <button type="button" disabled={selectedIds.length + selectedPendingEmails.length === 0} onClick={() => { setSelectedIds([]); setSelectedPendingEmails([]); }} className="w-full rounded-sm px-3 py-2 text-left text-sm hover:bg-secondary disabled:opacity-40">取消选择</button>
               <div className="my-1 border-t border-border" />
               <button type="button" disabled={selectedTokens.length === 0 || isBatchUpdating} onClick={() => void handleUpdateStatuses(selectedTokens, "正常")} className="w-full rounded-sm px-3 py-2 text-left text-sm hover:bg-secondary disabled:opacity-40">批量启用</button>
               <button type="button" disabled={selectedTokens.length === 0 || isBatchUpdating} onClick={() => void handleUpdateStatuses(selectedTokens, "禁用")} className="w-full rounded-sm px-3 py-2 text-left text-sm hover:bg-secondary disabled:opacity-40">批量禁用</button>
-              <button type="button" disabled={selectedAbnormalTokens.length === 0 || activeRepairId !== null || isStartingRepair} onClick={() => void handleRepairSelected()} className="w-full rounded-sm px-3 py-2 text-left text-sm hover:bg-secondary disabled:opacity-40">修复选中异常账号（{selectedAbnormalTokens.length}）</button>
+              <button type="button" disabled={selectedAbnormalTokens.length + selectedPendingEmails.length === 0 || activeRepairId !== null || isStartingRepair} onClick={() => void handleRepairSelected()} className="w-full rounded-sm px-3 py-2 text-left text-sm hover:bg-secondary disabled:opacity-40">修复选中异常账号（{selectedAbnormalTokens.length + selectedPendingEmails.length}）</button>
               <button type="button" disabled={abnormalTokens.length === 0 || isDeleting} onClick={() => void handleDeleteTokens(abnormalTokens)} className="w-full rounded-sm px-3 py-2 text-left text-sm text-rose-600 hover:bg-rose-50 disabled:opacity-40">移除异常账号</button>
               <button type="button" disabled={selectedTokens.length === 0 || isDeleting} onClick={() => void handleDeleteTokens(selectedTokens)} className="w-full rounded-sm px-3 py-2 text-left text-sm text-rose-600 hover:bg-rose-50 disabled:opacity-40">删除选中</button>
             </PopoverContent>
           </Popover>
-          {selectedIds.length > 0 ? <span className="text-xs font-medium text-muted-foreground">已选 {selectedIds.length}</span> : null}
+          {selectedIds.length + selectedPendingEmails.length > 0 ? <span className="text-xs font-medium text-muted-foreground">已选 {selectedIds.length + selectedPendingEmails.length}</span> : null}
           {viewMode === "grid" ? (
             <label className="inline-flex cursor-pointer items-center gap-2 text-xs text-muted-foreground sm:ml-auto">
               <Checkbox checked={allCurrentSelected} onCheckedChange={(checked) => toggleSelectAll(Boolean(checked))} />
@@ -1430,13 +1497,16 @@ function AccountsPageContent() {
                     <th className="w-24 px-4 py-2.5 font-medium">额度</th>
                     <th className="w-40 px-4 py-2.5 font-medium">恢复时间</th>
                     <th className="w-36 px-4 py-2.5 font-medium">注册时间</th>
-                    <th className="w-18 px-4 py-2.5 font-medium">成功</th>
-                    <th className="w-18 px-4 py-2.5 font-medium">失败</th>
+                    <th className="w-18 px-4 py-2.5 font-medium" title="当前额度窗口内的成功次数">成功</th>
+                    <th className="w-18 px-4 py-2.5 font-medium" title="当前额度窗口内的失败次数">失败</th>
                     <th className="w-24 px-4 py-2.5 font-medium">操作</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {currentRows.map((account) => {
+                  {currentRows.map((row) => {
+                    if (isPendingRow(row)) return pendingRow(row, "list");
+                    const account = row;
+                    const windowStats = accountWindowStats(account, statsNow);
                     return (
                       <tr
                         key={account.access_token}
@@ -1519,34 +1589,19 @@ function AccountsPageContent() {
                         </td>
                         <td className="px-4 py-3">
                           <div className="font-data text-[12px] leading-5 text-muted-foreground">{account.email ?? "—"}</div>
-                          {account.password ? (
-                            <button
-                              type="button"
-                              title="复制登录密码"
-                              aria-label="复制登录密码"
-                              onClick={() => void copyPassword(account)}
-                              className="mt-1 inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
-                            >
-                              <Copy className="size-3.5" /> 密码
-                            </button>
-                          ) : null}
+                          {account.password ? <div className="mt-1 text-xs text-muted-foreground">密码已保存</div> : null}
+                          <button
+                            type="button"
+                            title="复制账号----密码----2FA 密钥"
+                            aria-label="复制账号凭据"
+                            onClick={() => void copyCredentials(account)}
+                            className="mt-1 inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+                          >
+                            <Copy className="size-3.5" /> 复制账号凭据
+                          </button>
                           {account.mfa_status ? (
                             <div className="mt-1 flex items-center gap-2 text-xs text-muted-foreground">
                               <span>2FA {account.mfa_status === "enabled" ? "已启用" : account.mfa_status === "pending" ? "待确认" : "失败"}</span>
-                              {account.mfa_secret ? (
-                                <button
-                                  type="button"
-                                  title="复制 2FA 密钥"
-                                  aria-label="复制 2FA 密钥"
-                                  onClick={() => {
-                                    void navigator.clipboard.writeText(account.mfa_secret!);
-                                    toast.success("2FA 密钥已复制");
-                                  }}
-                                  className="cursor-pointer hover:text-foreground"
-                                >
-                                  <Copy className="size-3.5" />
-                                </button>
-                              ) : null}
                               {account.mfa_status === "enabled" ? (
                                 <button
                                   type="button"
@@ -1580,8 +1635,8 @@ function AccountsPageContent() {
                         <td className="px-4 py-3 font-data text-xs leading-5 text-muted-foreground">
                           {formatDateTime(account.created_at)}
                         </td>
-                        <td className="px-4 py-3 font-data tabular-nums text-emerald-600">{account.success}</td>
-                        <td className="px-4 py-3 font-data tabular-nums text-rose-500">{account.fail}</td>
+                        <td className="px-4 py-3 font-data tabular-nums text-emerald-600">{windowStats?.success ?? "—"}</td>
+                        <td className="px-4 py-3 font-data tabular-nums text-rose-500">{windowStats?.fail ?? "—"}</td>
                         <td className="px-4 py-3">
                           <div className="flex items-center gap-0.5 text-muted-foreground">
                             <button
@@ -1607,6 +1662,11 @@ function AccountsPageContent() {
                             {account.status === "异常" && account.mfa_secret ? (
                               <button type="button" title={!account.email || !account.password ? "缺少邮箱或登录密码" : "使用密码和 2FA 尝试登录"} aria-label="使用密码和 2FA 尝试登录" className="cursor-pointer rounded-md p-1.5 transition hover:bg-secondary hover:text-foreground disabled:opacity-50" onClick={() => void handleMFALogin(account)} disabled={mfaLoginToken !== null || !account.email || !account.password}>
                                 {mfaLoginToken === account.access_token ? <LoaderCircle className="size-4 animate-spin" /> : <LogIn className="size-4" />}
+                              </button>
+                            ) : null}
+                            {(account.mfa_status === "failed" || account.mfa_status === "pending") ? (
+                              <button type="button" title="补设验证器 2FA" aria-label="补设验证器 2FA" className="cursor-pointer rounded-md p-1.5 transition hover:bg-secondary hover:text-foreground disabled:opacity-50" onClick={() => void handleMFASetup(account)} disabled={mfaSetupToken !== null}>
+                                {mfaSetupToken === account.access_token ? <LoaderCircle className="size-4 animate-spin" /> : <KeyRound className="size-4" />}
                               </button>
                             ) : null}
                             <button
@@ -1639,10 +1699,13 @@ function AccountsPageContent() {
             </div>
             ) : (
               <div className="grid gap-3 p-4 sm:grid-cols-2 xl:grid-cols-3">
-                {currentRows.map((account) => (
-                  <AccountCard
+                {currentRows.map((row) => {
+                  if (isPendingRow(row)) return pendingRow(row, "grid");
+                  const account = row;
+                  return <AccountCard
                     key={account.access_token}
                     account={account}
+                    statsNow={statsNow}
                     proxyLabel={accountProxyLabel(account, proxyGroups, accountGroups)}
                     selected={selectedIds.includes(account.access_token)}
                     onSelectChange={(checked) => {
@@ -1655,25 +1718,22 @@ function AccountsPageContent() {
                     onEdit={() => openEditDialog(account)}
                     onRefresh={() => void handleRefreshAccounts([account.access_token])}
                     onMFALogin={() => void handleMFALogin(account)}
+                    onMFASetup={() => void handleMFASetup(account)}
                     onToggleStatus={() => void handleUpdateStatuses([account.access_token], account.status === "禁用" ? "正常" : "禁用")}
                     onDelete={() => void handleDeleteTokens([account.access_token])}
                     onCopyToken={() => {
                       void navigator.clipboard.writeText(account.access_token);
                       toast.success("token 已复制");
                     }}
-                    onCopyPassword={() => void copyPassword(account)}
-                    onCopyMFA={() => {
-                      if (!account.mfa_secret) return;
-                      void navigator.clipboard.writeText(account.mfa_secret);
-                      toast.success("2FA 密钥已复制");
-                    }}
+                    onCopyCredentials={() => void copyCredentials(account)}
                     onCopyMFACode={() => void copyMFACode(account)}
                     isRefreshing={isRefreshing}
                     isMFALoggingIn={mfaLoginToken !== null}
+                    isMFASettingUp={mfaSetupToken !== null}
                     isDeleting={isDeleting}
                     isUpdating={isUpdating}
-                  />
-                ))}
+                  />;
+                })}
               </div>
             )}
 

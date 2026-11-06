@@ -57,3 +57,23 @@ func TestStreamImageSlotsStopsOnSaveFailure(t *testing.T) {
 		t.Fatalf("stream events = %s", output)
 	}
 }
+
+func TestStreamImageSlotsIncludesUsage(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	usage := map[string]any{"input_tokens": 1, "output_tokens": 2, "total_tokens": 3, "estimated": true}
+	_, err := streamImageSlots(recorder, context.Background(), "gpt-image-2", 1, 1,
+		func() ([]upstreamImageResult, error) {
+			return []upstreamImageResult{{Bytes: []byte("image")}}, nil
+		},
+		func(upstreamImageResult) (map[string]any, error) {
+			return map[string]any{"url": "/images/result.png"}, nil
+		},
+		func(upstreamImageResult) map[string]any { return usage },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if output := recorder.Body.String(); !strings.Contains(output, `"usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}`) || !strings.Contains(output, `"usage_estimated":true`) || strings.Contains(output, `"usage":{"estimated"`) {
+		t.Fatalf("stream usage missing: %s", output)
+	}
+}

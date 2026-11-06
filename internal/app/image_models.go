@@ -2,14 +2,15 @@ package app
 
 import "strings"
 
-// Web image models use the ordinary ChatGPT Web image route. The route itself
-// is selected as auto; the public model name is retained for compatibility and
-// logging.
+// gpt-image-2 uses the auto Web route. Versioned Web model slugs are sent
+// unchanged so the upstream can select the requested model.
 var webImageModels = []string{
 	"gpt-image-2",
 	"gpt-image-2.5",
 	"gpt-image-2.5-flare",
 	"gpt-image-2.5-sunburst",
+	"gpt-image-2.6-sunburst",
+	"gpt-image-2.6-flare",
 }
 
 func normalizeImageModel(model string) string {

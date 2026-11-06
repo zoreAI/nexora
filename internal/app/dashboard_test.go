@@ -1,6 +1,7 @@
 package app
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -9,6 +10,49 @@ import (
 	"testing"
 	"time"
 )
+
+func TestDashboardCountsPendingRegistrationsAsAbnormal(t *testing.T) {
+	s := pendingRecoveryTestServer(t)
+	s.logSvc = &logService{store: s.store}
+	normal, abnormal, banned := "normal@example.com", "abnormal@example.com", "banned@example.com"
+	if err := s.store.SaveAccounts([]Account{
+		{AccessToken: "normal", Email: &normal, Status: "正常", Quota: 5},
+		{AccessToken: "abnormal", Email: &abnormal, Status: "异常"},
+		{AccessToken: "banned", Email: &banned, Status: "封号"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, email := range []string{"pending@example.com", banned} {
+		if err := s.register.savePendingPassword(email, "private-password", "注册中断"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, email := range []string{"PENDING@example.com", "recovery-only@example.com", banned} {
+		if err := s.register.recordRecoveryEmail(email, "注册中断"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/dashboard", nil)
+	req.Header.Set("Authorization", "Bearer admin-key")
+	rec := httptest.NewRecorder()
+	s.handleDashboard(rec, req)
+	var result struct {
+		Accounts struct {
+			Total    int            `json:"total"`
+			Statuses map[string]int `json:"statuses"`
+			Quota    int            `json:"remaining_quota"`
+		} `json:"accounts"`
+	}
+	if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &result) != nil {
+		t.Fatalf("dashboard status=%d", rec.Code)
+	}
+	if got := result.Accounts; got.Total != 5 || got.Statuses["异常"] != 3 || got.Statuses["封号"] != 1 || got.Statuses["正常"] != 1 || got.Quota != 5 {
+		t.Fatalf("dashboard counted pending or banned records incorrectly: %+v", got)
+	}
+	if len(s.store.LoadAccounts()) != 3 || strings.Contains(rec.Body.String(), "private-password") {
+		t.Fatal("dashboard changed the serving pool or exposed pending credentials")
+	}
+}
 
 func TestDashboardBucketsCountCompletedCalls(t *testing.T) {
 	dir := t.TempDir()

@@ -1,6 +1,31 @@
 package app
 
-import "testing"
+import (
+	"context"
+	"fmt"
+	"testing"
+)
+
+func TestReLoginCancellationDoesNotIncrementAccountFailures(t *testing.T) {
+	store := NewStore(t.TempDir())
+	defer store.Close()
+	if err := store.SaveAccounts([]Account{{AccessToken: "token", Status: "异常", Fail: 2}}); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{store: store}
+	if err := s.recordReLoginFailure("token", fmt.Errorf("OTP interrupted: %w", context.Canceled)); err != nil {
+		t.Fatal(err)
+	}
+	if account := store.LoadAccounts()[0]; account.Fail != 2 || account.LastUsedAt != nil {
+		t.Fatal("manual stop changed account failure state")
+	}
+	if err := s.recordReLoginFailure("token", context.DeadlineExceeded); err != nil {
+		t.Fatal(err)
+	}
+	if store.LoadAccounts()[0].Fail != 3 {
+		t.Fatal("real timeout must still count as failure")
+	}
+}
 
 func TestPersistReLoginAccountPreservesConcurrentAccountChanges(t *testing.T) {
 	store := NewStore(t.TempDir())

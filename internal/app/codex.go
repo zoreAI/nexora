@@ -16,6 +16,9 @@ const codexImageInstruction = "You are an image generation assistant."
 
 func isCodexImageRequest(model, resolution string) bool {
 	m := strings.ToLower(strings.TrimSpace(model))
+	if isWebImageModel(m) && m != "gpt-image-2" {
+		return false
+	}
 	return strings.Contains(m, "codex-gpt-image-2") || normalizeResolution(resolution) == "2k" || normalizeResolution(resolution) == "4k"
 }
 
@@ -150,6 +153,7 @@ func (c *UpstreamClient) GenerateCodexImage(ctx context.Context, prompt, model, 
 	defer resp.Body.Close()
 	items := []map[string]any{}
 	completed := []map[string]any{}
+	var usage map[string]any
 	for payload := range parseSSE(resp.Body) {
 		if payload == "[DONE]" {
 			break
@@ -169,6 +173,7 @@ func (c *UpstreamClient) GenerateCodexImage(ctx context.Context, prompt, model, 
 		}
 		if typ == "response.completed" {
 			if respObj, ok := event["response"].(map[string]any); ok {
+				usage, _ = respObj["usage"].(map[string]any)
 				if out, ok := respObj["output"].([]any); ok {
 					for _, raw := range out {
 						if item, ok := raw.(map[string]any); ok {
@@ -196,7 +201,7 @@ func (c *UpstreamClient) GenerateCodexImage(ctx context.Context, prompt, model, 
 		if err != nil {
 			continue
 		}
-		results = append(results, upstreamImageResult{Bytes: data, RevisedPrompt: strAny(item["revised_prompt"], prompt)})
+		results = append(results, upstreamImageResult{Bytes: data, RevisedPrompt: strAny(item["revised_prompt"], prompt), Usage: usage})
 	}
 	if len(results) == 0 {
 		return nil, errors.New("Codex image generation returned no image")

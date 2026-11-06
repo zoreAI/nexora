@@ -59,7 +59,6 @@ type UpstreamClient struct {
 	timezone                 string
 	browserDate              string
 	imageTurnTrace           string
-	imageBrowserID           string
 }
 
 type chatRequirements struct{ Token, ProofToken, TurnstileToken, SOToken string }
@@ -67,6 +66,7 @@ type chatRequirements struct{ Token, ProofToken, TurnstileToken, SOToken string 
 type upstreamImageResult struct {
 	Bytes         []byte
 	RevisedPrompt string
+	Usage         map[string]any
 }
 
 type upstreamStatusError struct {
@@ -445,7 +445,7 @@ func (c *UpstreamClient) conversationHeaders(path string, cr chatRequirements) m
 	return h
 }
 func (c *UpstreamClient) imageHeaders(path string, cr chatRequirements, conduit, accept string) map[string]string {
-	h := map[string]string{"Content-Type": "application/json", "Accept": accept, "OpenAI-Sentinel-Chat-Requirements-Token": cr.Token, "Originator": "Codex Browser", "X-OpenAI-Codex-Window-Type": "browser", "X-OpenAI-Web-Frontend": "codex_webview", "X-Oai-Mcp-Form-Version": "2"}
+	h := map[string]string{"Content-Type": "application/json", "Accept": accept, "OpenAI-Sentinel-Chat-Requirements-Token": cr.Token}
 	if cr.ProofToken != "" {
 		h["OpenAI-Sentinel-Proof-Token"] = cr.ProofToken
 	}
@@ -613,18 +613,34 @@ func (c *UpstreamClient) GenerateImage(ctx context.Context, prompt, model, size,
 	sedimentIDs := []string{}
 	message := ""
 	state := newUpstreamConversationState("", nil)
-	generated := false
 	// 限制 SSE 读取时长，防止上游无限挂起。
 	sseCtx, sseCancel := context.WithTimeout(ctx, opts.Timeout)
 	defer sseCancel()
 	// 从 resp.Body 读取 SSE，受 sseCtx 控制
-	done := make(chan struct{}, 1)
+	done := make(chan map[string]any, 1)
 	go func() {
-		defer func() { done <- struct{}{} }()
+		var usage map[string]any
+		eventCount := 0
+		usageFields := map[string]bool{}
+		defer func() {
+			fields := make([]string, 0, len(usageFields))
+			for field := range usageFields {
+				fields = append(fields, field)
+			}
+			sort.Strings(fields)
+			traceLogf(ctx, "│  ├─ image SSE usage diagnostic events=%d token_fields=%v usage_found=%t", eventCount, fields, usage != nil)
+			done <- usage
+		}()
 		for ev := range parseSSE(resp.Body) {
 			if ev == "[DONE]" {
-				generated = true
 				return
+			}
+			eventCount++
+			for _, field := range imageUsageFieldNamesFromSSE(ev) {
+				usageFields[field] = true
+			}
+			if current := upstreamImageUsageFromSSE(ev); current != nil {
+				usage = current
 			}
 			updateImageState(ev, &cid, &message)
 			if meta, ok := state.Apply(ev); ok {
@@ -638,16 +654,23 @@ func (c *UpstreamClient) GenerateImage(ctx context.Context, prompt, model, size,
 				}
 			}
 		}
-		generated = true
 	}()
+	var upstreamUsage map[string]any
 	select {
-	case <-done:
+	case upstreamUsage = <-done:
 	case <-sseCtx.Done():
-		if !generated {
+		select {
+		case upstreamUsage = <-done:
+		default:
 			return nil, fmt.Errorf("image generation SSE timed out (%ds)", int(opts.Timeout/time.Second))
 		}
 	}
 	traceLogf(ctx, "│  ├─ image SSE result blocked=%t tool_invoked=%v turn_use_case=%q file_ids=%d sediment_ids=%d text_len=%d", state.Blocked, state.ToolInvoked, state.TurnUseCase, len(fileIDs), len(sedimentIDs), len(message))
+	// GIFs created by the interpreter are separate sandbox attachments. Resolve
+	// them before falling back to the static image previews in the same turn.
+	if len(sandboxGIFPaths(message)) > 0 && cid != "" {
+		return c.downloadConversationGIFs(ctx, cid, prompt, upstreamUsage)
+	}
 	fileIDs, sedimentIDs, err = c.imageIDsAfterSSE(ctx, cid, message, state, fileIDs, sedimentIDs, opts)
 	if err != nil {
 		return nil, err
@@ -677,7 +700,7 @@ func (c *UpstreamClient) GenerateImage(ctx context.Context, prompt, model, size,
 			continue
 		}
 		seenBytes[sum] = true
-		results = append(results, upstreamImageResult{Bytes: b, RevisedPrompt: prompt})
+		results = append(results, upstreamImageResult{Bytes: b, RevisedPrompt: prompt, Usage: upstreamUsage})
 	}
 	traceLogf(ctx, "└─ image generation done images=%d", len(results))
 	return results, nil
@@ -701,21 +724,29 @@ func (c *UpstreamClient) imageIDsAfterSSE(ctx context.Context, cid, message stri
 func (c *UpstreamClient) prepareImage(ctx context.Context, prompt, model string, cr chatRequirements) (string, error) {
 	path := "/backend-api/f/conversation/prepare"
 	c.imageTurnTrace = uuid4()
-	c.imageBrowserID = uuid4()
 	timezone, timezoneOffset, _ := c.timezoneInfo()
-	payload := map[string]any{"action": "next", "browser_context": map[string]any{"instance_id": c.imageBrowserID}, "parent_message_id": clientCreatedRoot, "model": c.imageModelSlug(model), "client_prepare_state": "sent", "client_prepare_dispatch": "debounced", "client_prepare_source": "composer_editor_state", "is_do_not_remember": false, "timezone_offset_min": timezoneOffset, "timezone": timezone, "thinking_effort": "standard", "system_hints": []string{"picture_v2"}, "partial_query": map[string]any{"id": uuid4(), "author": map[string]any{"role": "user"}, "content": map[string]any{"content_type": "text", "parts": []string{prompt}}}, "supported_encodings": []string{"v1"}, "local_function_names": []string{"local.continue_in_work"}, "client_contextual_info": imageClientContext()}
+	payload := map[string]any{"action": "next", "fork_from_shared_post": false, "parent_message_id": clientCreatedRoot, "model": c.imageModelSlug(model), "client_prepare_state": "success", "timezone_offset_min": timezoneOffset, "timezone": timezone, "conversation_mode": map[string]any{"kind": "primary_assistant"}, "system_hints": []string{"picture_v2"}, "partial_query": map[string]any{"id": uuid4(), "author": map[string]any{"role": "user"}, "content": map[string]any{"content_type": "text", "parts": []string{prompt}}}, "supports_buffering": true, "supported_encodings": []string{"v1"}, "client_contextual_info": map[string]any{"app_name": "chatgpt.com"}}
 	resp, err := c.do(ctx, http.MethodPost, path, c.imageHeaders(path, cr, "", "*/*"), payload, false)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
 	var data map[string]any
-	_ = json.NewDecoder(resp.Body).Decode(&data)
-	token := strAny(data["conduit_token"], "")
-	if token == "" {
-		return "", errors.New("missing conduit_token")
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return "", fmt.Errorf("decode image prepare response: %w", err)
 	}
-	return token, nil
+	if value := data["error"]; value != nil {
+		return "", fmt.Errorf("image prepare failed: %v", value)
+	}
+	if status := strAny(data["status"], ""); status != "" && status != "ok" && status != "success" {
+		return "", fmt.Errorf("image prepare failed: status=%s", status)
+	}
+	// The upstream may acknowledge prepare without issuing a conduit token.
+	// In that case the conversation request omits X-Conduit-Token.
+	if _, exists := data["conduit_token"]; !exists && data["status"] == nil {
+		return "", errors.New("invalid image prepare response")
+	}
+	return strAny(data["conduit_token"], ""), nil
 }
 func (c *UpstreamClient) startImage(ctx context.Context, prompt, model string, cr chatRequirements, conduit string, refs []map[string]any) (*http.Response, error) {
 	path := "/backend-api/f/conversation"
@@ -735,13 +766,10 @@ func (c *UpstreamClient) startImage(ctx context.Context, prompt, model string, c
 	if len(attachments) > 0 {
 		metadata["attachments"] = attachments
 	}
-	payload := map[string]any{"action": "next", "browser_context": map[string]any{"instance_id": c.imageBrowserID}, "messages": []any{map[string]any{"id": uuid4(), "author": map[string]any{"role": "user", "name": nil, "metadata": map[string]any{}}, "channel": nil, "create_time": float64(time.Now().UnixNano()) / 1e9, "end_turn": nil, "content": content, "metadata": metadata, "recipient": "all", "status": "finished_successfully", "update_time": nil, "weight": 1}}, "parent_message_id": clientCreatedRoot, "model": c.imageModelSlug(model), "client_prepare_state": "success", "is_do_not_remember": false, "turn_attribution": map[string]any{"turn_trigger": "composer"}, "genui_state_snapshots": []any{}, "timezone_offset_min": timezoneOffset, "timezone": timezone, "thinking_effort": "standard", "system_hints": []string{"picture_v2"}, "supported_encodings": []string{"v1"}, "local_function_names": []string{"local.continue_in_work"}, "client_contextual_info": imageClientContext()}
+	payload := map[string]any{"action": "next", "messages": []any{map[string]any{"id": uuid4(), "author": map[string]any{"role": "user"}, "create_time": float64(time.Now().UnixNano()) / 1e9, "content": content, "metadata": metadata}}, "parent_message_id": clientCreatedRoot, "model": c.imageModelSlug(model), "client_prepare_state": "success", "timezone_offset_min": timezoneOffset, "timezone": timezone, "conversation_mode": map[string]any{"kind": "primary_assistant"}, "enable_message_followups": true, "system_hints": []string{"picture_v2"}, "supports_buffering": true, "supported_encodings": []string{"v1"}, "client_contextual_info": clientContext(), "paragen_cot_summary_display_override": "allow", "force_parallel_switch": "auto"}
 	return c.do(ctx, http.MethodPost, path, c.imageHeaders(path, cr, conduit, "text/event-stream"), payload, true)
 }
 
-func imageClientContext() map[string]any {
-	return map[string]any{"app_name": "chatgpt.com", "app_surface": "codex_browser", "has_web_push_capabilities": true, "web_push_notification_permission": "default"}
-}
 func (c *UpstreamClient) uploadImage(ctx context.Context, data []byte, name string, timeout time.Duration) (map[string]any, error) {
 	traceLogf(ctx, "│  ├─ upload image begin name=%s bytes=%d", name, len(data))
 	cfg, _, err := image.DecodeConfig(bytes.NewReader(data))
@@ -2128,7 +2156,10 @@ func normalizeTextModelOptions(model string) textModelOptions {
 
 func imageModelSlug(model string) string {
 	if isWebImageModel(model) {
-		return "auto"
+		if normalizeImageModel(model) == "gpt-image-2" {
+			return "auto"
+		}
+		return normalizeImageModel(model)
 	}
 	if isCodexImageModel(model) {
 		return "codex-gpt-image-2"
@@ -2137,11 +2168,7 @@ func imageModelSlug(model string) string {
 }
 
 func (c *UpstreamClient) imageModelSlug(model string) string {
-	slug := imageModelSlug(model)
-	if slug == "auto" && c.defaultModelSlug != "" {
-		return c.defaultModelSlug
-	}
-	return slug
+	return imageModelSlug(model)
 }
 func clientContext() map[string]any {
 	return map[string]any{"is_dark_mode": false, "time_since_loaded": 120, "page_height": 900, "page_width": 1400, "pixel_ratio": 2, "screen_height": 1440, "screen_width": 2560, "app_name": "chatgpt.com"}

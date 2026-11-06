@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -45,21 +46,38 @@ type RegisterStats struct {
 }
 
 type RegisterConfig struct {
-	Enabled          bool               `json:"enabled"`
-	Mail             RegisterMailConfig `json:"mail"`
-	Proxy            string             `json:"proxy"`
-	Total            int                `json:"total"`
-	Threads          int                `json:"threads"`
-	Mode             string             `json:"mode"`
-	TargetQuota      int                `json:"target_quota"`
-	TargetAvailable  int                `json:"target_available"`
-	CheckInterval    int                `json:"check_interval"`
-	FixedPassword    string             `json:"fixed_password"`
-	ProfileName      string             `json:"profile_name,omitempty"`
-	ProfileBirthdate string             `json:"profile_birthdate,omitempty"`
-	Stats            RegisterStats      `json:"stats"`
-	Logs             []registerLogItem  `json:"logs,omitempty"`
-	Failures         []registerFailure  `json:"failures,omitempty"`
+	Enabled          bool                      `json:"enabled"`
+	Mail             RegisterMailConfig        `json:"mail"`
+	Proxy            string                    `json:"proxy"`
+	Total            int                       `json:"total"`
+	Threads          int                       `json:"threads"`
+	Mode             string                    `json:"mode"`
+	TargetQuota      int                       `json:"target_quota"`
+	TargetAvailable  int                       `json:"target_available"`
+	CheckInterval    int                       `json:"check_interval"`
+	FixedPassword    string                    `json:"fixed_password"`
+	ProfileName      string                    `json:"profile_name,omitempty"`
+	ProfileBirthdate string                    `json:"profile_birthdate,omitempty"`
+	Stats            RegisterStats             `json:"stats"`
+	Logs             []registerLogItem         `json:"logs,omitempty"`
+	Failures         []registerFailure         `json:"failures,omitempty"`
+	PendingPasswords []registerPendingPassword `json:"pending_passwords,omitempty"`
+	RecoveryEmails   []registerRecoveryEmail   `json:"recovery_emails,omitempty"`
+}
+
+type registerRecoveryEmail struct {
+	Email     string `json:"email"`
+	Step      string `json:"step"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+type registerPendingPassword struct {
+	Email          string           `json:"email"`
+	Password       string           `json:"password"`
+	PasswordStatus string           `json:"password_status,omitempty"`
+	State          string           `json:"state"`
+	UpdatedAt      string           `json:"updated_at"`
+	Mailbox        *registerMailbox `json:"mailbox,omitempty"`
 }
 
 type registerLogItem struct {
@@ -76,17 +94,22 @@ type registerFailure struct {
 }
 
 type registerService struct {
-	mu                sync.RWMutex
-	path              string
-	store             *Store
-	initErr           error
-	cfg               RegisterConfig
-	logs              []registerLogItem
-	providerIndex     int
-	server            *Server
-	cancel            context.CancelFunc
-	runFunc           func(context.Context)
-	passwordStepProbe func(context.Context, RegisterConfig) error
+	mu                          sync.RWMutex
+	path                        string
+	store                       *Store
+	initErr                     error
+	cfg                         RegisterConfig
+	logs                        []registerLogItem
+	providerIndex               int
+	server                      *Server
+	cancel                      context.CancelFunc
+	runFunc                     func(context.Context)
+	passwordStepProbe           func(context.Context, RegisterConfig) error
+	mfaSessionFactory           func(string) (*registerSession, error)
+	recoverySessionFactory      func(string) (*registerSession, error)
+	passwordBrowserFactory      func(context.Context, *registerSession, Account, bool, func(context.Context, time.Time) (string, error)) (map[string]any, error)
+	signupBrowserFactory        func(context.Context, *registerSession, string, string, registerProfileConfig, func(context.Context, time.Time) (string, error)) (map[string]any, error)
+	passwordResetBrowserFactory func(context.Context, registerProvider, *registerMailbox, string, string) (map[string]any, error)
 }
 
 func defaultRegisterConfig() RegisterConfig {
@@ -167,6 +190,8 @@ func normalizeRegisterConfigWithOptions(raw RegisterConfig, hasAPIUseRegisterPro
 	}
 	cfg.Stats = raw.Stats
 	cfg.Failures = raw.Failures
+	cfg.PendingPasswords = raw.PendingPasswords
+	cfg.RecoveryEmails = raw.RecoveryEmails
 	cfg.Stats.Threads = cfg.Threads
 	if cfg.Stats.Threads <= 0 {
 		cfg.Stats.Threads = cfg.Threads
@@ -213,6 +238,13 @@ func (s *registerService) load() error {
 			}
 		}
 		s.cfg = normalizeRegisterConfigWithOptions(cfg, registerJSONHasNestedKey(raw, "mail", "api_use_register_proxy"))
+		// Runtime counters are not durable. A process restart cannot have
+		// workers from the previous process still running, so discard a stale
+		// running count when the persisted job is stopped. Keep the completed
+		// counters and pending/recovery records for the next repair run.
+		if !s.cfg.Enabled {
+			s.cfg.Stats.Running = 0
+		}
 		return nil
 	}
 	if err := ensureNotDir(s.path); err != nil {
@@ -225,6 +257,9 @@ func (s *registerService) load() error {
 		_ = json.Unmarshal(b, &raw)
 	}
 	s.cfg = normalizeRegisterConfigWithOptions(raw, hasAPIUseRegisterProxy)
+	if !s.cfg.Enabled {
+		s.cfg.Stats.Running = 0
+	}
 	return nil
 }
 
@@ -239,6 +274,8 @@ func (s *registerService) saveLocked() error {
 
 func (s *registerService) snapshotLocked() RegisterConfig {
 	cfg := s.cfg
+	cfg.PendingPasswords = append([]registerPendingPassword(nil), s.cfg.PendingPasswords...)
+	cfg.RecoveryEmails = append([]registerRecoveryEmail(nil), s.cfg.RecoveryEmails...)
 	cfg.Stats = enrichRegisterRuntimeStats(cfg.Stats)
 	cfg.Logs = append([]registerLogItem(nil), s.logs...)
 	if len(cfg.Logs) > 300 {
@@ -276,6 +313,121 @@ func (s *registerService) recordFailure(jobID string, task int, err error) {
 		s.cfg.Failures = s.cfg.Failures[len(s.cfg.Failures)-300:]
 	}
 	_ = s.saveLocked()
+}
+
+func (s *registerService) savePendingPassword(email, password, state string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.cfg.PendingPasswords {
+		if strings.EqualFold(s.cfg.PendingPasswords[i].Email, email) {
+			if s.cfg.PendingPasswords[i].Password != password {
+				s.cfg.PendingPasswords[i].PasswordStatus = "unverified"
+			}
+			s.cfg.PendingPasswords[i].Password = password
+			s.cfg.PendingPasswords[i].State = state
+			s.cfg.PendingPasswords[i].UpdatedAt = nowISO()
+			return s.saveLocked()
+		}
+	}
+	s.cfg.PendingPasswords = append(s.cfg.PendingPasswords, registerPendingPassword{Email: email, Password: password, PasswordStatus: "unverified", State: state, UpdatedAt: nowISO()})
+	return s.saveLocked()
+}
+
+func (s *registerService) confirmPendingPassword(email, password string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.cfg.PendingPasswords {
+		item := &s.cfg.PendingPasswords[i]
+		if !strings.EqualFold(item.Email, email) {
+			continue
+		}
+		if item.Password != password {
+			return errors.New("候选密码已变化，保留原记录")
+		}
+		item.PasswordStatus = "confirmed"
+		item.State = "密码接口已接受，等待登录令牌及 2FA"
+		item.UpdatedAt = nowISO()
+		return s.saveLocked()
+	}
+	return errors.New("待接续密码记录不存在")
+}
+
+func (s *registerService) clearPendingPassword(email string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i, pending := range s.cfg.PendingPasswords {
+		if strings.EqualFold(pending.Email, email) {
+			s.cfg.PendingPasswords = append(s.cfg.PendingPasswords[:i], s.cfg.PendingPasswords[i+1:]...)
+			return s.saveLocked()
+		}
+	}
+	return nil
+}
+
+func (s *registerService) pendingPasswordForEmail(email string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, pending := range s.cfg.PendingPasswords {
+		if strings.EqualFold(pending.Email, email) {
+			return pending.Password
+		}
+	}
+	return ""
+}
+
+func (s *registerService) hasRecoveryEmail(email string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, item := range s.cfg.RecoveryEmails {
+		if strings.EqualFold(item.Email, email) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *registerService) recordRecoveryEmail(email, step string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.cfg.RecoveryEmails {
+		if strings.EqualFold(s.cfg.RecoveryEmails[i].Email, email) {
+			s.cfg.RecoveryEmails[i] = registerRecoveryEmail{Email: email, Step: step, UpdatedAt: nowISO()}
+			return s.saveLocked()
+		}
+	}
+	s.cfg.RecoveryEmails = append(s.cfg.RecoveryEmails, registerRecoveryEmail{Email: email, Step: step, UpdatedAt: nowISO()})
+	return s.saveLocked()
+}
+
+func (s *registerService) clearRecoveryEmail(email string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i, item := range s.cfg.RecoveryEmails {
+		if strings.EqualFold(item.Email, email) {
+			s.cfg.RecoveryEmails = append(s.cfg.RecoveryEmails[:i], s.cfg.RecoveryEmails[i+1:]...)
+			return s.saveLocked()
+		}
+	}
+	return nil
+}
+
+func (s *Server) clearCompletedRegisterRecovery(accounts []Account) {
+	if s == nil || s.register == nil {
+		return
+	}
+	for _, account := range accounts {
+		email := strings.TrimSpace(ptrString(account.Email))
+		if email == "" || ptrString(account.Password) == "" || account.PasswordStatus != "confirmed" {
+			continue
+		}
+		_ = s.register.clearPendingPassword(email)
+		// Enrollment saves its secret before activation. Keeping that secret is
+		// not evidence that MFA completed; unrelated imports/edits must not
+		// discard the remaining recovery work.
+		if account.MFAStatus == "enabled" && ptrString(account.MFASecret) != "" {
+			_ = s.register.clearRecoveryEmail(email)
+		}
+	}
 }
 
 func (s *registerService) clearLogsLocked() {
@@ -387,7 +539,11 @@ func (s *registerService) stop() RegisterConfig {
 	defer s.mu.Unlock()
 	s.cfg.Enabled = false
 	s.cfg.Stats.UpdatedAt = nowISO()
-	s.logs = append(s.logs, registerLogItem{Time: nowISO(), Text: "已请求停止注册任务，不再提交新任务，正在等待当前运行任务结束", Level: "yellow"})
+	message := "已请求停止注册任务，不再提交新任务，正在等待当前运行任务结束"
+	if s.cfg.Stats.JobKind == "repair_abnormal" {
+		message = "已请求停止异常账号修复，不再提交新任务，正在等待当前运行任务结束"
+	}
+	s.logs = append(s.logs, registerLogItem{Time: nowISO(), Text: message, Level: "yellow"})
 	_ = s.saveLocked()
 	return s.snapshotLocked()
 }
@@ -410,8 +566,8 @@ func (s *registerService) repairAbnormal() RegisterConfig {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.cancel != nil {
-		s.cancel()
-		s.cancel = nil
+		s.logs = append(s.logs, registerLogItem{Time: nowISO(), Text: "当前任务尚未结束，请等待运行中的账号处理完成", Level: "yellow"})
+		return s.snapshotLocked()
 	}
 	cfg := s.cfg
 	cfg.Enabled = true
@@ -480,6 +636,10 @@ func (s *Server) handleRegisterStart(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Method != http.MethodPost {
 		writeErr(w, 405, "method not allowed")
+		return
+	}
+	if cfg := s.register.snapshot(); cfg.Enabled || cfg.Stats.Running > 0 {
+		writeJSON(w, 200, map[string]any{"register": cfg})
 		return
 	}
 	writeJSON(w, 200, map[string]any{"register": s.register.start("register")})

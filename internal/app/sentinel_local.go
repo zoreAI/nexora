@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -18,6 +19,7 @@ import (
 	"github.com/chromedp/cdproto/emulation"
 	"github.com/chromedp/cdproto/page"
 	"github.com/chromedp/chromedp"
+	"github.com/chromedp/chromedp/remote"
 )
 
 type sentinelIdentity struct {
@@ -47,6 +49,7 @@ type browserSentinelSolver struct {
 	pageContext context.Context
 	cancelPage  context.CancelFunc
 	cancelAlloc context.CancelFunc
+	profileDir  string
 	openedAt    time.Time
 }
 
@@ -86,9 +89,13 @@ func (s *browserSentinelSolver) close() {
 	if s.cancelAlloc != nil {
 		s.cancelAlloc()
 	}
+	if s.profileDir != "" {
+		_ = os.RemoveAll(s.profileDir)
+	}
 	s.pageContext = nil
 	s.cancelPage = nil
 	s.cancelAlloc = nil
+	s.profileDir = ""
 	s.openedAt = time.Time{}
 }
 
@@ -136,12 +143,24 @@ func (s *browserSentinelSolver) ensurePage(request context.Context) error {
 	if strings.Contains(s.proxy, "@") {
 		return errors.New("authenticated proxy is not supported by local Chrome; use an unauthenticated local proxy")
 	}
+	profileDir, err := os.MkdirTemp("", "nexora-chrome-")
+	if err != nil {
+		return fmt.Errorf("create Chrome profile: %w", err)
+	}
 	opts := append([]chromedp.ExecAllocatorOption{}, chromedp.DefaultExecAllocatorOptions[:]...)
 	opts = append(opts,
 		chromedp.ExecPath(chromePath),
-		chromedp.Flag("headless", "new"),
+		remote.WebSocket,
+		chromedp.Flag("headless", true),
+		chromedp.Flag("remote-debugging-port", "0"),
 		chromedp.Flag("enable-automation", false),
 		chromedp.Flag("disable-blink-features", "AutomationControlled"),
+		chromedp.Flag("disable-gpu", true),
+		chromedp.Flag("disable-software-rasterizer", true),
+		chromedp.Flag("disable-dev-shm-usage", true),
+		chromedp.Flag("no-first-run", true),
+		chromedp.Flag("no-default-browser-check", true),
+		chromedp.Flag("user-data-dir", filepath.Clean(profileDir)),
 		chromedp.WindowSize(1280, 800),
 	)
 	if s.proxy != "" {
@@ -152,7 +171,7 @@ func (s *browserSentinelSolver) ensurePage(request context.Context) error {
 	}
 	allocCtx, cancelAlloc := chromedp.NewExecAllocator(context.Background(), opts...)
 	pageCtx, cancelPage := chromedp.NewContext(allocCtx)
-	s.pageContext, s.cancelPage, s.cancelAlloc = pageCtx, cancelPage, cancelAlloc
+	s.pageContext, s.cancelPage, s.cancelAlloc, s.profileDir = pageCtx, cancelPage, cancelAlloc, profileDir
 	// The first Run owns the browser lifetime, so bound startup by canceling the
 	// page itself and stop that timer once Chrome has launched.
 	startupTimer := time.AfterFunc(60*time.Second, cancelPage)
@@ -162,7 +181,7 @@ func (s *browserSentinelSolver) ensurePage(request context.Context) error {
 	stopRequest()
 	if err != nil {
 		s.close()
-		return fmt.Errorf("start Chrome: %w", err)
+		return fmt.Errorf("start Chrome executable %q: %w (set CHATGPT2API_CHROME_BIN to a runnable Chromium binary or use the direct HTTP recovery path)", chromePath, err)
 	}
 	ctx, cancel := s.runContext(request, 60*time.Second)
 	defer cancel()

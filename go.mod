@@ -12,6 +12,9 @@ require (
 	github.com/chromedp/chromedp v0.21.0
 	github.com/dop251/goja v0.0.0-20261014135309-2cb8274eed06
 	github.com/jackc/pgx/v5 v5.11.0
+	github.com/joho/godotenv v1.5.1
+	github.com/tiktoken-go/tokenizer v0.8.1
+	golang.org/x/image v0.41.0
 	modernc.org/sqlite v1.60.1
 )
 
@@ -51,6 +54,7 @@ require (
 	golang.org/x/sync v0.24.0 // indirect
 	golang.org/x/sys v0.48.0 // indirect
 	golang.org/x/text v0.43.0 // indirect
+	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/libc v1.77.1 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.12.1 // indirect

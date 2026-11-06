@@ -29,12 +29,15 @@ func TestGenerateCodexImageRequest(t *testing.T) {
 			if body.Model != codexResponsesModel || len(body.Tools) != 1 || body.Tools[0].Action != "generate" || body.Tools[0].Quality != "auto" || body.Tools[0].OutputFormat != "png" {
 				t.Fatalf("unexpected Codex request: %+v", body)
 			}
-			return upstreamTestResponse(200, "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"image_generation_call\",\"result\":\"aW1hZ2U=\"}}\n\ndata: [DONE]\n\n"), nil
+			return upstreamTestResponse(200, "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"image_generation_call\",\"result\":\"aW1hZ2U=\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":12,\"output_tokens\":34,\"total_tokens\":46}}}\n\ndata: [DONE]\n\n"), nil
 		}),
 	}
 	result, err := client.GenerateCodexImage(context.Background(), "A blue cup", "plus-codex-gpt-image-2", "1024x1024", nil)
 	if err != nil || len(result) != 1 || string(result[0].Bytes) != "image" {
 		t.Fatalf("Codex image result = %+v, err = %v", result, err)
+	}
+	if result[0].Usage["total_tokens"] != float64(46) {
+		t.Fatalf("Codex image usage = %+v", result[0].Usage)
 	}
 }
 

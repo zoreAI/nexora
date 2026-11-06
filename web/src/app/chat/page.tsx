@@ -53,7 +53,7 @@ const CHAT_MODEL_STORAGE_KEY = "chatgpt2api:chat_last_model";
 const CHAT_IMAGE_SIZES = ["1:1", "16:9", "4:3", "3:4", "9:16"];
 const CHAT_IMAGE_RESOLUTIONS = ["1k", "2k", "4k"];
 const isImageModel = (model: string) =>
-  ["gpt-image-2", "gpt-image-2.5", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst", "codex-gpt-image-2"].includes(model) || model.endsWith("-codex-gpt-image-2");
+  ["gpt-image-2", "gpt-image-2.5", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst", "gpt-image-2.6-sunburst", "gpt-image-2.6-flare", "codex-gpt-image-2"].includes(model) || model.endsWith("-codex-gpt-image-2");
 const CHAT_ACCOUNT_TYPE_LABELS: Record<string, string> = {
   free: "Free",
   Plus: "Plus",
@@ -343,7 +343,7 @@ function ChatPageContent() {
   const [input, setInput] = useState("");
   const [uploads, setUploads] = useState<ChatUpload[]>([]);
   const [selectedModel, setSelectedModel] = useState("auto");
-  const [availableModels, setAvailableModels] = useState<string[]>(["auto", "gpt-image-2", "gpt-image-2.5", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst"]);
+  const [availableModels, setAvailableModels] = useState<string[]>(["auto", "gpt-image-2", "gpt-image-2.5", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst", "gpt-image-2.6-sunburst", "gpt-image-2.6-flare"]);
   const [imageSize, setImageSize] = useState("");
   const [imageResolution, setImageResolution] = useState("");
   const [isStreaming, setIsStreaming] = useState(false);
@@ -968,7 +968,7 @@ function ChatPageContent() {
           <input
             ref={fileInputRef}
             type="file"
-            accept="image/*"
+            accept="*"
             multiple
             className="hidden"
             onChange={(event) => {

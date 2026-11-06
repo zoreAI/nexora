@@ -566,7 +566,7 @@ func (s *Server) handleImageStorageSync(w http.ResponseWriter, r *http.Request) 
 
 func isImageFile(path string) bool {
 	switch strings.ToLower(filepath.Ext(path)) {
-	case ".png", ".jpg", ".jpeg", ".webp":
+	case ".png", ".jpg", ".jpeg", ".webp", ".gif":
 		return true
 	}
 	return false

@@ -9,6 +9,8 @@ export type ImageModel =
   | "gpt-image-2.5"
   | "gpt-image-2.5-flare"
   | "gpt-image-2.5-sunburst"
+  | "gpt-image-2.6-sunburst"
+  | "gpt-image-2.6-flare"
   | "codex-gpt-image-2"
   | `${string}-codex-gpt-image-2`;
 
@@ -108,6 +110,7 @@ export type Account = {
   status: AccountStatus;
   quota: number;
   initial_quota?: number;
+  image_quota_baseline?: number | null;
   image_quota_unknown?: boolean;
   trial_state?: "eligible" | "discount" | "subscribed" | "not-eligible" | "unknown";
   trial_promo_id?: string;
@@ -126,9 +129,14 @@ export type Account = {
   restore_at?: string | null;
   success: number;
   fail: number;
+  window_success?: number;
+  window_fail?: number;
+  window_started_at?: string;
+  window_reset_at?: string;
   last_used_at?: string | null;
   mailbox?: Record<string, unknown> | null;
   password?: string | null;
+  password_status?: "confirmed" | "unverified";
   refresh_token?: string | null;
   id_token?: string | null;
   created_at?: string | null;
@@ -139,8 +147,20 @@ export type AccountImportRecord = Record<string, unknown> & {
   accessToken?: string;
 };
 
+export type PendingRegisterAccount = {
+  email: string;
+  status: "异常";
+  state: string;
+  updated_at: string;
+  password_saved: boolean;
+  password_status?: "confirmed" | "unverified";
+  recovery_status?: "pending" | "identity_verification" | "registration_disallowed";
+  recovery_hint?: string;
+};
+
 type AccountListResponse = {
   items: Account[];
+  pending_registrations?: PendingRegisterAccount[];
 };
 
 export type Model = {
@@ -517,6 +537,17 @@ export type RegisterConfig = {
     task: number;
     reason: string;
   }>;
+  pending_passwords?: Array<{
+    email: string;
+    password: string;
+    state: string;
+    updated_at: string;
+  }>;
+  recovery_emails?: Array<{
+    email: string;
+    step: string;
+    updated_at: string;
+  }>;
 };
 
 export async function login(authKey: string) {
@@ -548,6 +579,13 @@ export async function fetchAccountMFACode(accessToken: string) {
 
 export async function loginAbnormalAccountWithMFA(accessToken: string) {
   return httpRequest<{ ok: boolean }>("/api/accounts/mfa/login", {
+    method: "POST",
+    body: { access_token: accessToken },
+  });
+}
+
+export async function setupAccountMFA(accessToken: string) {
+  return httpRequest<{ ok: boolean }>("/api/accounts/mfa/setup", {
     method: "POST",
     body: { access_token: accessToken },
   });
@@ -585,15 +623,56 @@ export async function fetchAccountRefreshProgress(progressId: string) {
   return httpRequest<AccountRefreshProgress>(`/api/accounts/refresh/progress/${encodeURIComponent(progressId)}`);
 }
 
-export async function startAccountRepair(accessTokens: string[]) {
-  return httpRequest<{ progress_id: string; total: number }>("/api/accounts/repair/start", {
+export async function startAccountRepair(accessTokens: string[], recoveryEmails: string[] = [], retryBlocked = false) {
+  return httpRequest<{ progress_id: string; total: number; skipped?: number }>("/api/accounts/repair/start", {
     method: "POST",
-    body: { access_tokens: accessTokens },
+    body: { access_tokens: accessTokens, recovery_emails: recoveryEmails, retry_blocked: retryBlocked },
   });
 }
 
 export async function fetchAccountRepairProgress(progressId: string) {
   return httpRequest<AccountRefreshProgress>(`/api/accounts/repair/progress/${encodeURIComponent(progressId)}`);
+}
+
+export type CodexAuthCredential = {
+  email: string;
+  password: string;
+  mfa_secret: string;
+  proxy?: string;
+  name?: string;
+};
+
+export type CodexAuthBatchItem = {
+  index: number;
+  email: string;
+  name?: string;
+  status: "queued" | "success" | "failed";
+  error?: string;
+};
+
+export type CodexAuthBatchProgress = {
+  progress_id: string;
+  total: number;
+  processed: number;
+  succeeded: number;
+  failed: number;
+  done: boolean;
+  items: CodexAuthBatchItem[];
+};
+
+export async function startCodexAuthBatch(accounts: CodexAuthCredential[], concurrency = 3, mode: "codex" | "web" = "codex") {
+  return httpRequest<{ progress_id: string; total: number }>("/api/codex-auth/batch/start", {
+    method: "POST",
+    body: { accounts, concurrency, mode },
+  });
+}
+
+export async function fetchCodexAuthBatchProgress(progressId: string) {
+  return httpRequest<CodexAuthBatchProgress>(`/api/codex-auth/batch/${encodeURIComponent(progressId)}`);
+}
+
+export function getCodexAuthBatchExportUrl(progressId: string) {
+  return `/api/codex-auth/batch/${encodeURIComponent(progressId)}/export`;
 }
 
 export async function updateAccount(
@@ -604,6 +683,8 @@ export async function updateAccount(
     quota?: number;
     proxy?: string;
     group_id?: string;
+    password?: string;
+    mfa_secret?: string;
   },
 ) {
   return httpRequest<AccountUpdateResponse>("/api/accounts/update", {
@@ -1314,6 +1395,14 @@ export async function testProxyGroup(payload: { id?: string; node_id?: string; u
 
 export async function importProxyNodes(payload: { text: string; existing_urls: string[] }) {
   return httpRequest<ProxyNodeImportResult>("/api/proxy/nodes/import", { method: "POST", body: payload });
+}
+
+export type RegisterMihomoOptions = { controller: string; secret: string; config_path: string; group: string; port_start: number };
+export function readRegisterMihomoGroups(options: RegisterMihomoOptions) {
+  return httpRequest<{ groups: Array<{ name: string; nodes: number; members: number }>; controller: string; config_path: string }>("/api/register/mihomo/groups", { method: "POST", body: options });
+}
+export function applyRegisterMihomo(options: RegisterMihomoOptions) {
+  return httpRequest<{ group: ProxyGroup; proxy: string }>("/api/register/mihomo/apply", { method: "POST", body: options });
 }
 
 /* ───────── 公共画廊 ───────── */

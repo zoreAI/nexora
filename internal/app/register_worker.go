@@ -48,22 +48,60 @@ var (
 )
 
 type registerSession struct {
-	client               *stdhttp.Client
-	curl                 upstreamHTTPDoer
-	userAgent            string
-	acceptLanguage       string
-	secCHUA              string
-	secCHUAArch          string
-	secCHUAPlatform      string
-	secCHUAPlatformVer   string
-	accessFlowID         string
-	sentinelSOToken      string
-	browser              string
-	lastAuthorizeLanding string
-	registerOTPURL       string
-	lastAuthorizeDebug   registerFlowDebug
-	lastValidateOTPDebug registerFlowDebug
-	lastCreateDebug      registerFlowDebug
+	client                    *stdhttp.Client
+	curl                      upstreamHTTPDoer
+	proxyRoute                proxyRoute
+	userAgent                 string
+	acceptLanguage            string
+	secCHUA                   string
+	secCHUAArch               string
+	secCHUAPlatform           string
+	secCHUAPlatformVer        string
+	accessFlowID              string
+	sentinelSOToken           string
+	browser                   string
+	lastAuthorizeLanding      string
+	registerOTPURL            string
+	lastAuthorizeDebug        registerFlowDebug
+	lastValidateOTPDebug      registerFlowDebug
+	lastCreateDebug           registerFlowDebug
+	passwordConfirmed         bool
+	passwordLoginRejected     bool
+	allowPasswordlessFallback bool
+	loginMFASecret            string
+	onPasswordAccepted        func() error
+	oauthClientID             string
+}
+
+type registerAuthRetryKey struct{}
+type registerCallbackRetryKey struct{}
+
+func resetRegisterAuthSession(s *registerSession) error {
+	if s == nil || s.client == nil {
+		return errors.New("注册会话不可重置")
+	}
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		return err
+	}
+	s.client.Jar = jar
+	s.accessFlowID = uuid4()
+	s.lastAuthorizeLanding = ""
+	s.registerOTPURL = ""
+	s.lastAuthorizeDebug = registerFlowDebug{}
+	s.lastValidateOTPDebug = registerFlowDebug{}
+	s.lastCreateDebug = registerFlowDebug{}
+	s.passwordConfirmed = false
+	s.passwordLoginRejected = false
+	return nil
+}
+
+func registerAuthSessionInvalid(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "invalid_state") || strings.Contains(text, "invalid_auth_step") || strings.Contains(text, "session is no longer valid")
 }
 
 type registerFlowDebug struct {
@@ -1104,7 +1142,7 @@ func (s *registerSession) platformAuthorizeOnce(ctx context.Context, deviceID, e
 		"X-Curl-Follow-Redirect":      "1",
 	}, nil, 10, 200)
 	if err != nil {
-		return "", err
+		return "", registerAuthorizationRequestError(err, targetURL)
 	}
 	finalURL := ""
 	if resp != nil && resp.Request != nil && resp.Request.URL != nil {
@@ -1147,47 +1185,67 @@ func authorizeLandingSummary(finalURL, body string) string {
 }
 
 func (s *registerSession) loginWithPassword(ctx context.Context, email, password, mfaSecret string, emailCode ...func(context.Context, time.Time) (string, error)) (map[string]any, error) {
+	return s.loginWithPasswordContinuation(ctx, email, password, mfaSecret, nil, emailCode...)
+}
+
+func (s *registerSession) loginWithPasswordContinuation(ctx context.Context, email, password, mfaSecret string, profile *registerProfileConfig, emailCode ...func(context.Context, time.Time) (string, error)) (map[string]any, error) {
+	s.passwordConfirmed = false
+	s.passwordLoginRejected = false
 	email = strings.TrimSpace(email)
 	password = strings.TrimSpace(password)
 	if email == "" || password == "" {
 		return nil, errors.New("email and password are required")
 	}
 	deviceID := uuid4()
+	// Authorization itself may send the OTP before returning the verification page.
+	codeNotBefore := time.Now().UTC().Truncate(time.Second)
+	reportAccountRepairProgress(ctx, "开始授权登录")
 	codeVerifier, err := s.platformAuthorizeRetry(ctx, deviceID, email, "login_or_signup", true)
 	if err != nil {
 		return nil, err
 	}
-	if !strings.HasPrefix(s.lastAuthorizeLanding, "login path=/log-in/password") {
-		return nil, fmt.Errorf("授权未进入密码登录步骤: %s", s.lastAuthorizeLanding)
-	}
-	sentinel, err := s.createSentinelToken(ctx, deviceID, "password_verify")
-	if err != nil {
-		return nil, err
-	}
-	body := map[string]any{"password": password}
-	b, err := json.Marshal(body)
-	if err != nil {
-		return nil, err
-	}
-	headers := s.registerCommonJSONHeaders(deviceID, registerAuthBase+"/")
-	headers["OpenAI-Sentinel-Token"] = sentinel
-	resp, err := s.doBytes(ctx, stdhttp.MethodPost, registerAuthBase+"/api/accounts/password/verify", headers, b, bytes.NewReader(b))
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	var payload map[string]any
-	if len(bytes.TrimSpace(raw)) > 0 {
-		_ = json.Unmarshal(raw, &payload)
-	}
-	if resp.StatusCode != 200 {
-		return nil, registerHTTPError(stdhttp.MethodPost, registerAuthBase+"/api/accounts/password/verify", resp.StatusCode, string(raw))
+	switch {
+	case strings.HasPrefix(s.lastAuthorizeLanding, "login path=/log-in/password"):
+		codeNotBefore = time.Now().UTC().Truncate(time.Second)
+		reportAccountRepairProgress(ctx, "验证已保存密码")
+		payload, err = s.verifyLoginPassword(ctx, deviceID, password)
+		if err != nil {
+			if isInvalidLoginPassword(err) {
+				s.passwordLoginRejected = true
+			}
+			if (profile == nil && !s.allowPasswordlessFallback) || !isInvalidLoginPassword(err) || len(emailCode) == 0 || emailCode[0] == nil {
+				return nil, err
+			}
+			reportAccountRepairProgress(ctx, "本地密码未通过验证，改用邮箱验证码")
+			if err := s.preparePasswordSignup(ctx, deviceID); err != nil {
+				return nil, fmt.Errorf("切换邮箱验证码登录失败: %w", err)
+			}
+			payload = map[string]any{"page": map[string]any{"type": "email_otp_verification"}}
+		} else {
+			s.passwordConfirmed = true
+		}
+	case strings.HasPrefix(s.lastAuthorizeLanding, "verification path=/email-verification"):
+		// The authorization session is already waiting for email verification.
+		payload = map[string]any{"page": map[string]any{"type": "email_otp_verification"}}
+	case profile != nil && strings.HasPrefix(s.lastAuthorizeLanding, "signup path=/create-account/password"):
+		// The earlier password submission may never have been accepted. Reuse
+		// the persisted password at the step explicitly offered by the server.
+		codeNotBefore = time.Now().UTC().Truncate(time.Second)
+		reportAccountRepairProgress(ctx, "接续提交注册密码")
+		if err := s.registerUser(ctx, deviceID, email, password); err != nil {
+			return nil, fmt.Errorf("接续提交注册密码失败: %w", err)
+		}
+		s.passwordConfirmed = true
+		payload = map[string]any{"page": map[string]any{"type": "email_otp_verification"}}
+	default:
+		return nil, fmt.Errorf("授权未进入密码登录步骤: %s", s.lastAuthorizeLanding)
 	}
 	if page, ok := payload["page"].(map[string]any); ok && strAny(page["type"], "") == "mfa_challenge" {
 		if strings.TrimSpace(mfaSecret) == "" {
 			return nil, errors.New("重新授权需要 2FA，账号未保存密钥")
 		}
+		reportAccountRepairProgress(ctx, "验证已保存的 2FA")
 		payload, err = s.verifyPasswordLoginMFA(ctx, deviceID, payload, mfaSecret)
 		if err != nil {
 			return nil, err
@@ -1200,27 +1258,94 @@ func (s *registerSession) loginWithPassword(ctx context.Context, email, password
 			if len(emailCode) == 0 || emailCode[0] == nil {
 				return nil, errors.New("重新授权需要邮箱验证码，账号没有可用取码方式")
 			}
-			codeNotBefore := time.Now().UTC()
+			reportAccountRepairProgress(ctx, "请求邮箱验证码")
 			if err := s.sendOTP(ctx, deviceID); err != nil {
 				return nil, fmt.Errorf("发送邮箱验证码失败: %w", err)
 			}
+			reportAccountRepairProgress(ctx, "等待邮箱验证码")
 			otp, err := emailCode[0](ctx, codeNotBefore)
 			if err != nil {
 				return nil, fmt.Errorf("获取邮箱验证码失败: %w", err)
 			}
+			reportAccountRepairProgress(ctx, "校验邮箱验证码")
 			continueURL, err = s.validateOTPContinueURL(ctx, deviceID, otp)
 			if err != nil {
+				if registerAuthSessionInvalid(err) && ctx.Value(registerAuthRetryKey{}) == nil {
+					// A stale auth cookie can survive a previous partial repair. Start
+					// one clean authorization session, including a fresh OTP boundary;
+					// never reuse the invalid session or its code.
+					reportAccountRepairProgress(ctx, "授权会话已失效，清理会话后重新开始（最多一次）")
+					if resetErr := resetRegisterAuthSession(s); resetErr != nil {
+						return nil, resetErr
+					}
+					retryCtx := context.WithValue(ctx, registerAuthRetryKey{}, true)
+					return s.loginWithPasswordContinuation(retryCtx, email, password, mfaSecret, profile, emailCode...)
+				}
 				return nil, fmt.Errorf("校验邮箱验证码失败: %w", err)
 			}
 			code = parseContinueCode(continueURL)
-			if code == "" {
-				return nil, errors.New("邮箱验证码已校验，但未返回 oauth callback code")
-			}
-		} else {
+		} else if profile == nil || !isRegisterProfileURL(continueURL) {
 			return nil, errors.New("password verify response missing oauth code")
 		}
 	}
+	if code == "" && profile != nil && isRegisterProfileURL(continueURL) {
+		reportAccountRepairProgress(ctx, "接续创建账号资料")
+		if err := s.visitAuthPage(ctx, continueURL, registerAuthBase+"/email-verification"); err != nil {
+			return nil, fmt.Errorf("接续账号资料页失败: %w", err)
+		}
+		continueURL, err = s.createAccount(ctx, deviceID, *profile)
+		if err != nil {
+			return nil, fmt.Errorf("接续创建账号资料失败: %w", err)
+		}
+		code = parseContinueCode(continueURL)
+	}
+	if code == "" {
+		if profile != nil && ctx.Value(registerCallbackRetryKey{}) == nil {
+			// A successful profile submission can leave the first authorization
+			// response without an OAuth code. Start one fresh authorization so an
+			// account that now exists can take the normal password-login branch;
+			// only then fall back to the browser flow.
+			reportAccountRepairProgress(ctx, "资料已提交但未返回 callback，清理会话后重新授权（最多一次）")
+			if resetErr := resetRegisterAuthSession(s); resetErr != nil {
+				return nil, resetErr
+			}
+			retryCtx := context.WithValue(ctx, registerCallbackRetryKey{}, true)
+			return s.loginWithPasswordContinuation(retryCtx, email, password, mfaSecret, profile, emailCode...)
+		}
+		return nil, errors.New("登录验证已完成，但未返回 oauth callback code")
+	}
+	reportAccountRepairProgress(ctx, "获取登录令牌")
 	return s.exchangeTokens(ctx, codeVerifier, code)
+}
+
+func (s *registerSession) verifyLoginPassword(ctx context.Context, deviceID, password string) (map[string]any, error) {
+	sentinel, err := s.createSentinelToken(ctx, deviceID, "password_verify")
+	if err != nil {
+		return nil, err
+	}
+	body, err := json.Marshal(map[string]any{"password": password})
+	if err != nil {
+		return nil, err
+	}
+	headers := s.registerCommonJSONHeaders(deviceID, registerAuthBase+"/")
+	headers["OpenAI-Sentinel-Token"] = sentinel
+	resp, err := s.doBytes(ctx, stdhttp.MethodPost, registerAuthBase+"/api/accounts/password/verify", headers, body, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != 200 {
+		return nil, registerHTTPError(stdhttp.MethodPost, registerAuthBase+"/api/accounts/password/verify", resp.StatusCode, string(raw))
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, fmt.Errorf("解析密码验证响应: %w", err)
+	}
+	return payload, nil
 }
 
 func (s *registerSession) verifyPasswordLoginMFA(ctx context.Context, deviceID string, passwordResponse map[string]any, secret string) (map[string]any, error) {
@@ -1659,8 +1784,14 @@ func continueURLFromResponse(resp *stdhttp.Response, bodyText string) (string, e
 	if len(bodyBytes) > 0 {
 		var payload map[string]any
 		if err := json.Unmarshal(bodyBytes, &payload); err == nil {
+			if page, ok := payload["page"].(map[string]any); ok && strAny(page["type"], "") == "identity_verification" {
+				return "", errors.New("账号需要手动完成身份验证（/verify-your-identity），保留待修复记录")
+			}
 			if continueURL := strings.TrimSpace(strAny(payload["continue_url"], strAny(payload["url"], ""))); continueURL != "" {
-				if code := parseContinueCode(continueURL); code != "" {
+				if err := registerIdentityVerificationError(continueURL); err != nil {
+					return "", err
+				}
+				if code := parseContinueCode(continueURL); code != "" || isRegisterProfileURL(continueURL) {
 					return continueURL, nil
 				}
 			}
@@ -1670,7 +1801,7 @@ func continueURLFromResponse(resp *stdhttp.Response, bodyText string) (string, e
 	if err := registerAuthErrorFromLocation(continueURL); err != nil {
 		return "", err
 	}
-	if continueURL != "" && parseContinueCode(continueURL) != "" {
+	if continueURL != "" && (parseContinueCode(continueURL) != "" || isRegisterProfileURL(continueURL)) {
 		return continueURL, nil
 	}
 	if resp.Request != nil && resp.Request.URL != nil {
@@ -1678,7 +1809,7 @@ func continueURLFromResponse(resp *stdhttp.Response, bodyText string) (string, e
 		if err := registerAuthErrorFromLocation(continueURL); err != nil {
 			return "", err
 		}
-		if continueURL != "" && parseContinueCode(continueURL) != "" {
+		if continueURL != "" && (parseContinueCode(continueURL) != "" || isRegisterProfileURL(continueURL)) {
 			return continueURL, nil
 		}
 	}
@@ -1689,6 +1820,9 @@ func registerAuthErrorFromLocation(location string) error {
 	location = strings.TrimSpace(location)
 	if location == "" {
 		return nil
+	}
+	if err := registerIdentityVerificationError(location); err != nil {
+		return err
 	}
 	u, err := url.Parse(location)
 	if err != nil {
@@ -1743,6 +1877,14 @@ func registerAuthErrorFromLocation(location string) error {
 	return fmt.Errorf("create account failed: %s", strings.Join(parts, " "))
 }
 
+func registerIdentityVerificationError(raw string) error {
+	u, err := url.Parse(raw)
+	if err == nil && (u.Host == "" || u.Host == "auth.openai.com") && strings.TrimRight(u.Path, "/") == "/verify-your-identity" {
+		return errors.New("账号需要手动完成身份验证（/verify-your-identity），保留待修复记录")
+	}
+	return nil
+}
+
 func (s *registerSession) exchangeTokens(ctx context.Context, codeVerifier, code string) (map[string]any, error) {
 	if strings.TrimSpace(codeVerifier) == "" {
 		return nil, errors.New("oauth code_verifier is empty")
@@ -1750,8 +1892,12 @@ func (s *registerSession) exchangeTokens(ctx context.Context, codeVerifier, code
 	if strings.TrimSpace(code) == "" {
 		return nil, errors.New("oauth callback code is empty")
 	}
+	clientID := s.oauthClientID
+	if strings.TrimSpace(clientID) == "" {
+		clientID = webOAuthClientID
+	}
 	body := map[string]any{
-		"client_id":     "app_2SKx67EdpoN0G6j64rFvigXD",
+		"client_id":     clientID,
 		"code_verifier": codeVerifier,
 		"grant_type":    "authorization_code",
 		"code":          code,
@@ -1859,6 +2005,7 @@ type registerTaskResult struct {
 	Stop       bool
 	StopReason string
 	Counted    bool
+	Skipped    bool
 }
 
 type registerCapacityExhaustedError struct {
@@ -1872,6 +2019,12 @@ type registerPasswordStepUnavailableError struct {
 }
 
 func (e registerPasswordStepUnavailableError) Error() string { return e.message }
+
+type registerRecoveryRequiredError struct {
+	message string
+}
+
+func (e registerRecoveryRequiredError) Error() string { return e.message }
 
 func (s *registerService) probePasswordSignup(ctx context.Context, cfg RegisterConfig) error {
 	route, err := s.resolveRegisterProxy(cfg.Proxy)
@@ -1899,49 +2052,110 @@ func (s *registerService) probePasswordSignup(ctx context.Context, cfg RegisterC
 }
 
 func (s *registerService) runRepairAbnormalJob(ctx context.Context) {
-	var candidates []Account
-	if s.server != nil && s.server.store != nil {
-		for _, account := range s.server.store.LoadAccounts() {
-			if account.Status == "异常" {
-				candidates = append(candidates, account)
-			}
+	cfg := s.snapshot()
+	if s.server != nil {
+		if err := s.server.ensureAccountRepairMihomo(ctx); err != nil {
+			s.appendLog("异常账号修复停止：准备 Mihomo 代理失败: "+err.Error(), "red")
+			s.mu.Lock()
+			s.cfg.Enabled = false
+			s.cfg.Stats.Running = 0
+			s.cfg.Stats.FinishedAt = nowISO()
+			s.cfg.Stats.UpdatedAt = nowISO()
+			s.cancel = nil
+			_ = s.saveLocked()
+			s.mu.Unlock()
+			return
 		}
 	}
-	s.appendLog(fmt.Sprintf("待修复异常账号 %d 个", len(candidates)), "yellow")
-	success, fail := 0, 0
-	for _, account := range candidates {
-		if ctx.Err() != nil {
-			break
+	threads := maxInt(cfg.Threads, 1)
+	targets := []accountRepairTarget{}
+	manual := 0
+	if s.server != nil && s.server.store != nil {
+		accounts := s.server.store.LoadAccounts()
+		pending := []string{}
+		for _, item := range s.server.pendingRegisterAccountsFrom(accounts) {
+			if item.RecoveryStatus != "pending" {
+				manual++
+				continue
+			}
+			pending = append(pending, item.Email)
 		}
+		targets = accountRepairTargets(accounts, pending)
+	}
+	if manual > 0 {
+		s.appendLog(fmt.Sprintf("跳过 %d 个需人工处理的未入池账号（身份验证或 Web 拒绝注册），处理后可在号池单条重新检查", manual), "yellow")
+	}
+	s.appendLog(fmt.Sprintf("待修复异常账号 %d 个（含注册待接续），线程数=%d", len(targets), threads), "yellow")
+	success, fail, canceled := 0, 0, 0
+	runAccountRepairTargets(ctx, targets, threads, accountRepairTimeout(cfg.Mail), func(ctx context.Context, target accountRepairTarget, index int) error {
+		return runAccountRepairWithProgress(ctx, 15*time.Second, func(message string) {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			if s.cfg.Stats.JobID != cfg.Stats.JobID {
+				return
+			}
+			s.logs = append(s.logs, registerLogItem{Time: nowISO(), Text: fmt.Sprintf("[任务%d] %s %s", index, target.email, message), Level: "yellow"})
+			if len(s.logs) > 300 {
+				s.logs = s.logs[len(s.logs)-300:]
+			}
+			s.cfg.Stats.UpdatedAt = nowISO()
+			_ = s.saveLocked()
+		}, func(ctx context.Context) error {
+			return s.server.repairAccountTarget(ctx, target, index)
+		})
+	}, func() {
 		s.mu.Lock()
-		s.cfg.Stats.Running = 1
+		defer s.mu.Unlock()
+		if s.cfg.Stats.JobID != cfg.Stats.JobID {
+			return
+		}
+		s.cfg.Stats.Running++
+		s.cfg.Stats.Threads = threads
 		s.cfg.Stats.UpdatedAt = nowISO()
 		_ = s.saveLocked()
-		s.mu.Unlock()
-		relogined, _, errs, _ := s.server.reLoginAccounts(ctx, []string{account.AccessToken})
-		if relogined > 0 {
+	}, func(item accountRepairTarget, index int, err error) {
+		if s.snapshot().Stats.JobID != cfg.Stats.JobID {
+			return
+		}
+		if err == nil {
 			success++
-			s.appendLog(fmt.Sprintf("%s 异常账号修复成功", ptrString(account.Email)), "green")
+			s.appendLog(fmt.Sprintf("[任务%d] %s 异常账号修复成功", index, item.email), "green")
+		} else if errors.Is(err, context.Canceled) && errors.Is(ctx.Err(), context.Canceled) {
+			canceled++
+			s.appendLog(fmt.Sprintf("[任务%d] %s 修复已取消，保留当前进度供下次接续", index, item.email), "yellow")
 		} else {
 			fail++
-			reason := "账号缺少可用的重新授权方式"
-			if len(errs) > 0 {
-				reason = strAny(errs[0]["error"], reason)
+			message := err.Error()
+			for _, secret := range []string{item.account.AccessToken, ptrString(item.account.Password), ptrString(item.account.MFASecret), ptrString(item.account.RefreshToken), ptrString(item.account.IDToken)} {
+				if secret != "" {
+					message = strings.ReplaceAll(message, secret, "[redacted]")
+				}
 			}
-			message := fmt.Sprintf("%s 异常账号修复失败: %s", ptrString(account.Email), reason)
+			message = fmt.Sprintf("[任务%d] %s 异常账号修复失败: %s", index, item.email, truncateText(message, 500))
 			s.appendLog(message, "red")
-			s.recordFailure(s.snapshot().Stats.JobID, success+fail, errors.New(message))
+			s.recordFailure(cfg.Stats.JobID, index, errors.New(message))
 		}
 		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.cfg.Stats.JobID != cfg.Stats.JobID {
+			return
+		}
 		s.cfg.Stats.Success = success
 		s.cfg.Stats.Fail = fail
 		s.cfg.Stats.Done = success + fail
-		s.cfg.Stats.Running = 0
+		s.cfg.Stats.Running--
 		s.cfg.Stats.UpdatedAt = nowISO()
 		_ = s.saveLocked()
-		s.mu.Unlock()
-	}
+	}, func() bool {
+		snapshot := s.snapshot()
+		return snapshot.Enabled && snapshot.Stats.JobID == cfg.Stats.JobID
+	})
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cfg.Stats.JobID != cfg.Stats.JobID {
+		return
+	}
+	stopped := !s.cfg.Enabled || ctx.Err() != nil
 	s.cfg.Enabled = false
 	s.cfg.Stats.Success = success
 	s.cfg.Stats.Fail = fail
@@ -1949,10 +2163,16 @@ func (s *registerService) runRepairAbnormalJob(ctx context.Context) {
 	s.cfg.Stats.Running = 0
 	s.cfg.Stats.FinishedAt = nowISO()
 	s.cfg.Stats.UpdatedAt = nowISO()
-	s.logs = append(s.logs, registerLogItem{Time: nowISO(), Text: fmt.Sprintf("异常账号修复结束，成功%d，失败%d", success, fail), Level: "yellow"})
+	message := fmt.Sprintf("异常账号修复结束，成功%d，失败%d", success, fail)
+	if stopped {
+		message = fmt.Sprintf("异常账号修复已停止，成功%d，失败%d，未处理%d", success, fail, len(targets)-success-fail-canceled)
+		if canceled > 0 {
+			message += fmt.Sprintf("，取消%d", canceled)
+		}
+	}
+	s.logs = append(s.logs, registerLogItem{Time: nowISO(), Text: message, Level: "yellow"})
 	s.cancel = nil
 	_ = s.saveLocked()
-	s.mu.Unlock()
 }
 
 func (s *registerService) runRegisterJob(ctx context.Context) {
@@ -1961,12 +2181,24 @@ func (s *registerService) runRegisterJob(ctx context.Context) {
 	s.mu.Unlock()
 	threads := maxInt(cfg.Threads, 1)
 	submitted := 0
+	finished := 0
+	skipped := 0
 	done := 0
 	success := 0
 	fail := 0
 	results := make(chan registerTaskResult, threads)
 	var wg sync.WaitGroup
-	if s.passwordStepProbe != nil {
+	// Prepare once per job, including jobs resumed on server startup, before
+	// any probe or worker can use the dedicated Mihomo listeners.
+	if s.server != nil && s.server.store != nil {
+		if err := s.server.ensureRegisterMihomo(ctx); err != nil {
+			s.appendLog("注册任务停止：准备 Mihomo 注册代理失败: "+err.Error(), "red")
+			goto finish
+		}
+	}
+	// Pending accounts use the login path, so a new-account password-step probe
+	// must not block their recovery before a mailbox can be examined.
+	if s.passwordStepProbe != nil && len(cfg.RecoveryEmails) == 0 {
 		if err := s.passwordStepProbe(ctx, cfg); err != nil {
 			s.appendLog("注册任务停止："+err.Error(), "red")
 			goto finish
@@ -1982,11 +2214,11 @@ func (s *registerService) runRegisterJob(ctx context.Context) {
 		if !snapshot.Enabled {
 			break
 		}
-		if s.registerTargetReached(snapshot, submitted) {
+		if s.registerTargetReached(snapshot, submitted-skipped) {
 			break
 		}
-		running := submitted - done
-		for running < threads && !s.registerTargetReached(snapshot, submitted) && snapshot.Enabled && ctx.Err() == nil {
+		running := submitted - finished
+		for running < threads && !s.registerTargetReached(snapshot, submitted-skipped) && snapshot.Enabled && ctx.Err() == nil {
 			submitted++
 			running++
 			wg.Add(1)
@@ -1997,14 +2229,13 @@ func (s *registerService) runRegisterJob(ctx context.Context) {
 				result := registerTaskResult{OK: ok, Counted: true}
 				if err != nil {
 					result.Message = fmt.Sprintf("[任务%d] %s", jobIndex, err.Error())
-					var passwordErr registerPasswordStepUnavailableError
-					result.Stop = shouldStopForRegisterCapacityExhausted(err) || errors.As(err, &passwordErr)
-					if passwordErr.message != "" {
-						result.StopReason = "上游未提供设置密码步骤"
+					var recoveryErr registerRecoveryRequiredError
+					result.Skipped = errors.As(err, &recoveryErr)
+					result.Stop = shouldStopForRegisterCapacityExhausted(err)
+					if result.Skipped {
+						result.Counted = false
 					} else if result.Stop {
 						result.StopReason = "邮箱 provider 暂无可用资源"
-					}
-					if result.Stop {
 						result.Counted = false
 					} else {
 						s.recordFailure(snapshot.Stats.JobID, jobIndex, err)
@@ -2024,6 +2255,10 @@ func (s *registerService) runRegisterJob(ctx context.Context) {
 		select {
 		case result := <-results:
 			running--
+			finished++
+			if result.Skipped {
+				skipped++
+			}
 			if result.Counted {
 				done++
 				if result.OK {
@@ -2034,7 +2269,7 @@ func (s *registerService) runRegisterJob(ctx context.Context) {
 			}
 			if result.Message != "" {
 				level := "red"
-				if result.Stop {
+				if result.Stop || result.Skipped {
 					level = "yellow"
 				}
 				s.appendLog(result.Message, level)
@@ -2053,6 +2288,10 @@ finish:
 	for {
 		select {
 		case result := <-results:
+			finished++
+			if result.Skipped {
+				skipped++
+			}
 			if result.Counted {
 				done++
 				if result.OK {
@@ -2063,7 +2302,7 @@ finish:
 			}
 			if result.Message != "" {
 				level := "red"
-				if result.Stop {
+				if result.Stop || result.Skipped {
 					level = "yellow"
 				}
 				s.appendLog(result.Message, level)
@@ -2081,7 +2320,7 @@ drained:
 	s.cfg.Stats.Fail = fail
 	s.cfg.Stats.FinishedAt = nowISO()
 	s.cfg.Stats.UpdatedAt = nowISO()
-	s.logs = append(s.logs, registerLogItem{Time: nowISO(), Text: fmt.Sprintf("注册任务结束，成功%d，失败%d", success, fail), Level: "yellow"})
+	s.logs = append(s.logs, registerLogItem{Time: nowISO(), Text: fmt.Sprintf("注册任务结束，成功%d，失败%d，跳过%d", success, fail, skipped), Level: "yellow"})
 	s.cancel = nil
 	_ = s.saveLocked()
 	s.mu.Unlock()
@@ -2235,12 +2474,21 @@ func (s *registerService) enabledRegisterProviderCount(mail RegisterMailConfig) 
 	return count
 }
 
-func (s *registerService) runRegisterTask(ctx context.Context, cfg RegisterConfig, index int) (bool, error) {
+func (s *registerService) runRegisterTask(ctx context.Context, cfg RegisterConfig, index int) (ok bool, err error) {
 	s.appendLog(fmt.Sprintf("[任务%d] 任务启动", index), "yellow")
 	route, err := s.resolveRegisterProxy(cfg.Proxy)
 	if err != nil {
 		return false, fmt.Errorf("选择注册代理失败: %w", err)
 	}
+	defer func() {
+		if route.NodeID == "" || s.server == nil || s.server.store == nil {
+			return
+		}
+		if !ok && ctx.Err() == nil && isTransientRegisterNetworkError(err) {
+			_ = s.server.store.recordProxyNodeRuntimeResult(route, false)
+			s.appendLog(fmt.Sprintf("[任务%d] 注册代理节点[%s] 连接失败，已暂时跳过", index, route.NodeID), "yellow")
+		}
+	}()
 	if route.NodeID != "" {
 		s.appendLog(fmt.Sprintf("[任务%d] 注册代理节点[%s]", index, route.NodeID), "yellow")
 	}
@@ -2258,6 +2506,9 @@ func (s *registerService) runRegisterTask(ctx context.Context, cfg RegisterConfi
 				capacityExhaustedAttempts++
 			}
 			continue
+		}
+		if session, ok := provider.Session().(*registerSession); ok {
+			session.proxyRoute = route
 		}
 		mailbox, err = provider.CreateMailbox("")
 		if err == nil {
@@ -2293,15 +2544,22 @@ func (s *registerService) runRegisterTask(ctx context.Context, cfg RegisterConfi
 	} else {
 		s.appendLog(fmt.Sprintf("[任务%d] 邮箱创建完成: %s", index, email), "yellow")
 	}
-	fail := func(err error) (bool, error) {
-		if isRegisterContextCanceled(err) {
-			return false, err
+	if s.hasRecoveryEmail(email) || s.pendingPasswordForEmail(email) != "" {
+		if err := s.recordRecoveryEmail(email, "已领取，等待手动修复"); err != nil {
+			return false, fmt.Errorf("%s 保存待修复邮箱失败: %w", email, err)
 		}
+		s.appendLog(fmt.Sprintf("[任务%d] %s 已有密码或待接续记录，保留邮箱供异常修复", index, email), "yellow")
+		return false, registerRecoveryRequiredError{message: fmt.Sprintf("%s 可在号池的注册待修复区域接续登录并设置 2FA", email)}
+	}
+	fail := func(err error) (bool, error) {
 		reason := err.Error()
 		if email != "" {
 			reason = fmt.Sprintf("%s: %s", email, reason)
 		}
 		provider.MarkFailed(mailbox, reason)
+		if isRegisterContextCanceled(err) {
+			return false, err
+		}
 		return false, errors.New(reason)
 	}
 	password := cfg.FixedPassword
@@ -2319,9 +2577,23 @@ func (s *registerService) runRegisterTask(ctx context.Context, cfg RegisterConfi
 		landing = strings.TrimSpace(rs.lastAuthorizeLanding)
 	}
 	if resumeRegistration && !strings.HasPrefix(landing, "verification path=") {
-		message := fmt.Sprintf("%s: 授权未进入设置密码页，账号未创建；邮箱已领取，需保留供后续处理", email)
-		provider.MarkFailed(mailbox, message)
-		return false, registerPasswordStepUnavailableError{message: message}
+		if strings.HasPrefix(landing, "login path=") {
+			savedPassword := s.pendingPasswordForEmail(email)
+			if err := s.recordRecoveryEmail(email, landing); err != nil {
+				return fail(fmt.Errorf("保存待恢复邮箱失败: %w", err))
+			}
+			if savedPassword != "" {
+				s.appendLog(fmt.Sprintf("[任务%d] %s 已有密码记录，保留邮箱供异常修复", index, email), "yellow")
+				return false, registerRecoveryRequiredError{message: fmt.Sprintf("%s 可通过异常修复验证已保存密码并设置 2FA", email)}
+			}
+			if err := s.recoverPendingRegisterAccount(ctx, provider, mailbox, password, route.URL, index); err == nil {
+				return true, nil
+			} else {
+				provider.MarkFailed(mailbox, err.Error())
+				return false, registerRecoveryRequiredError{message: fmt.Sprintf("%s 已进入登录步骤，自动接续失败: %s", email, err)}
+			}
+		}
+		return fail(fmt.Errorf("授权进入 %s，本次未执行创建账号；邮箱可能存在此前未完成的注册状态", landing))
 	}
 	if landing != "" {
 		s.appendLog(fmt.Sprintf("[任务%d] 授权注册页完成[%s]", index, landing), "yellow")
@@ -2338,8 +2610,17 @@ func (s *registerService) runRegisterTask(ctx context.Context, cfg RegisterConfi
 		}
 	}
 	s.appendLog(fmt.Sprintf("[任务%d] 开始提交注册密码", index), "yellow")
+	if err := s.savePendingPassword(email, password, "提交待确认"); err != nil {
+		return fail(fmt.Errorf("保存待提交密码失败: %w", err))
+	}
+	if err := s.savePendingMailbox(email, mailbox); err != nil {
+		return fail(fmt.Errorf("保存注册接续邮箱失败: %w", err))
+	}
 	if err := provider.Session().registerUser(ctx, deviceID, email, password); err != nil {
 		return fail(err)
+	}
+	if err := s.savePendingPassword(email, password, "注册接口已接受"); err != nil {
+		s.appendLog(fmt.Sprintf("[任务%d] 注册密码已提交，但更新待处理状态失败: %s", index, err.Error()), "red")
 	}
 	s.appendLog(fmt.Sprintf("[任务%d] 提交注册密码完成", index), "yellow")
 	s.appendLog(fmt.Sprintf("[任务%d] 开始发送验证码", index), "yellow")
@@ -2445,19 +2726,20 @@ func (s *registerService) runRegisterTask(ctx context.Context, cfg RegisterConfi
 	idToken := strings.TrimSpace(strAny(tokens["id_token"], ""))
 	now := nowISO()
 	record := map[string]any{
-		"access_token":  accessToken,
-		"type":          "free",
-		"status":        "异常",
-		"mfa_status":    "pending",
-		"quota":         0,
-		"success":       0,
-		"fail":          0,
-		"email":         email,
-		"password":      password,
-		"refresh_token": refreshToken,
-		"id_token":      idToken,
-		"created_at":    now,
-		"source_type":   "web",
+		"access_token":    accessToken,
+		"type":            "free",
+		"status":          "异常",
+		"mfa_status":      "pending",
+		"quota":           0,
+		"success":         0,
+		"fail":            0,
+		"email":           email,
+		"password":        password,
+		"password_status": "confirmed",
+		"refresh_token":   refreshToken,
+		"id_token":        idToken,
+		"created_at":      now,
+		"source_type":     "web",
 	}
 	if mailbox.ClientID != "" {
 		record["client_id"] = mailbox.ClientID
@@ -2478,13 +2760,19 @@ func (s *registerService) runRegisterTask(ctx context.Context, cfg RegisterConfi
 	if err := s.importRegisterAccount(record); err != nil {
 		return false, fmt.Errorf("注册已完成但保存账号失败: %w", err)
 	}
+	if err := s.clearPendingPassword(email); err != nil {
+		s.appendLog(fmt.Sprintf("[任务%d] 账号已入池，但清理待处理密码记录失败: %s", index, err.Error()), "red")
+	}
+	if err := s.clearRecoveryEmail(email); err != nil {
+		s.appendLog(fmt.Sprintf("[任务%d] 账号已入池，但清理待恢复邮箱记录失败: %s", index, err.Error()), "red")
+	}
 	rs, ok := provider.Session().(*registerSession)
 	if !ok {
 		_ = s.server.store.updateAccountMFA(accessToken, "failed", "")
 		return false, fmt.Errorf("%s: 账号已保存但 2FA 未完成: 注册会话不可用", email)
 	}
 	s.appendLog(fmt.Sprintf("[任务%d] 开始设置验证器 2FA", index), "yellow")
-	if err := s.enableRegisterMFA(ctx, rs, accessToken, deviceID); err != nil {
+	if err := s.enableRegisterMFAWithFailover(ctx, rs, accessToken, deviceID); err != nil {
 		return false, fmt.Errorf("%s: 账号已保存但 2FA 未完成: %w", email, err)
 	}
 	s.appendLog(fmt.Sprintf("[任务%d] %s 验证器 2FA 已启用并保存", index, email), "green")
@@ -2503,6 +2791,254 @@ func (s *registerService) runRegisterTask(ctx context.Context, cfg RegisterConfi
 	}
 	s.appendLog(fmt.Sprintf("[任务%d] %s 注册成功", index, email), "green")
 	return true, nil
+}
+
+func (s *registerService) recoverPendingRegisterAccount(ctx context.Context, provider registerProvider, mailbox *registerMailbox, password, proxyURL string, index int) error {
+	email := strings.TrimSpace(mailbox.Address)
+	if s.pendingPasswordForEmail(email) != "" {
+		s.appendLog(fmt.Sprintf("[任务%d] %s 尝试已保存密码登录", index, email), "yellow")
+		if err := s.resumePendingRegisterAccount(ctx, provider, mailbox, password, index); err == nil {
+			return nil
+		} else {
+			for _, account := range s.loadCurrentAccounts() {
+				if strings.EqualFold(ptrString(account.Email), email) {
+					return err
+				}
+			}
+			s.appendLog(fmt.Sprintf("[任务%d] %s 密码登录未完成，改走邮箱验证与密码重置", index, email), "yellow")
+		}
+	}
+	if s.pendingPasswordForEmail(email) == "" {
+		if err := s.savePendingPassword(email, password, "拟用于重置，尚未提交"); err != nil {
+			return fmt.Errorf("保存待重置密码失败: %w", err)
+		}
+	}
+	s.appendLog(fmt.Sprintf("[任务%d] %s 开始浏览器邮箱验证与密码重置", index, email), "yellow")
+	tokens, err := resetPendingRegisterPassword(ctx, provider, mailbox, password, proxyURL)
+	if err != nil {
+		if saveErr := s.savePendingPassword(email, password, "需手动验证密码或重置"); saveErr != nil {
+			return fmt.Errorf("%w; 保存手动接续密码失败: %v", err, saveErr)
+		}
+		return err
+	}
+	if session, ok := provider.Session().(*registerSession); ok {
+		session.passwordConfirmed = true
+	}
+	return s.completeRecoveredRegisterAccount(ctx, provider, mailbox, password, tokens, index)
+}
+
+func shouldFallbackPendingRegistrationToBrowser(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || isAccountDeactivatedError(err) || isRateLimitErrorText(err) {
+		return false
+	}
+	if registerMailboxReceivedNoCode(err) {
+		return true
+	}
+	text := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"registration_disallowed",
+		"oauth callback code",
+		"password verify response missing oauth code",
+		"session is no longer valid",
+		"invalid_state",
+		"invalid_auth_step",
+	} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// A working mailbox returning no new code is different from an unreachable
+// provider. A fresh browser authorization can establish the correct OTP step,
+// but must not disguise provider errors or cancellation as another login.
+func registerMailboxReceivedNoCode(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || isRateLimitErrorText(err) || isAccountDeactivatedError(err) {
+		return false
+	}
+	message := err.Error()
+	if !strings.Contains(message, "获取邮箱验证码失败") {
+		return false
+	}
+	if strings.Contains(message, "no_code") {
+		return true
+	}
+	_, after, ok := strings.Cut(message, "无新验证码")
+	if !ok {
+		return false
+	}
+	count, _, ok := strings.Cut(after, "次")
+	n, parseErr := strconv.Atoi(count)
+	return ok && parseErr == nil && n > 0
+}
+
+func (s *registerService) resumePendingRegisterAccount(ctx context.Context, provider registerProvider, mailbox *registerMailbox, password string, index int) error {
+	session, ok := provider.Session().(*registerSession)
+	if !ok {
+		return errors.New("注册会话不可用于密码接续")
+	}
+	email := strings.TrimSpace(mailbox.Address)
+	cfg := s.snapshot()
+	profile := registerProfileConfig{Name: cfg.ProfileName, Birthdate: cfg.ProfileBirthdate}
+	previousHook := session.onPasswordAccepted
+	session.onPasswordAccepted = func() error { return s.confirmPendingPassword(email, password) }
+	defer func() { session.onPasswordAccepted = previousHook }()
+	// Do not repeat an already diagnosed Platform OTP timeout on every repair.
+	// The browser uses a fresh authorization with the page's own mail request.
+	for _, recovery := range cfg.RecoveryEmails {
+		if strings.EqualFold(recovery.Email, email) && registerMailboxReceivedNoCode(errors.New(recovery.Step)) {
+			reportAccountRepairProgress(ctx, "此前 Platform 未收到验证码，直接使用 ChatGPT Web 接续")
+			tokens, err := s.resumePendingRegisterInBrowser(ctx, session, provider, mailbox, password, profile)
+			if err != nil {
+				return fmt.Errorf("ChatGPT Web 接续未完成: %w", err)
+			}
+			return s.completeRecoveredRegisterAccount(ctx, provider, mailbox, password, tokens, index)
+		}
+	}
+	tokens, err := session.loginWithPasswordContinuation(ctx, email, password, "", &profile, func(ctx context.Context, notBefore time.Time) (string, error) {
+		mailbox.CodeNotBefore = notBefore
+		return provider.WaitForCode(ctx, mailbox)
+	})
+	if err != nil && (isInvalidLoginPassword(err) || session.passwordLoginRejected) {
+		// A persisted candidate can come from an interrupted registration and
+		// therefore be rejected by the login form. Reset it with a fresh mailbox
+		// OTP before treating the registration as unrecoverable.
+		reportAccountRepairProgress(ctx, "保存密码未生效，改用邮箱验证码重置密码")
+		resetTokens, resetErr := s.resetPendingRegisterPasswordForRepair(ctx, provider, mailbox, password, session.proxyRoute.URL)
+		if resetErr == nil {
+			session.passwordConfirmed = true
+			tokens, err = resetTokens, nil
+		} else {
+			err = fmt.Errorf("候选密码登录失败，邮箱重置密码也未完成: %w", resetErr)
+		}
+	}
+	if shouldFallbackPendingRegistrationToBrowser(err) {
+		platformErr := err
+		// A stored candidate does not prove an account exists. The Platform
+		// signup and ChatGPT Web signup have different authorization sessions.
+		reportAccountRepairProgress(ctx, "Platform 接续未完成，改用 ChatGPT Web 接续")
+		s.appendLog(fmt.Sprintf("[任务%d] %s Platform 接续未完成，按 ChatGPT Web 流程确认是否需要新注册", index, email), "yellow")
+		tokens, err = s.resumePendingRegisterInBrowser(ctx, session, provider, mailbox, password, profile)
+		if err == nil {
+			session.passwordConfirmed = session.passwordConfirmed || boolAny(tokens["password_confirmed"], false)
+		} else {
+			err = fmt.Errorf("ChatGPT Web 接续失败: %w；此前 Platform 接续失败: %s", err, platformErr)
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("接续注册未完成: %w", err)
+	}
+	return s.completeRecoveredRegisterAccount(ctx, provider, mailbox, password, tokens, index)
+}
+
+func (s *registerService) resumePendingRegisterInBrowser(ctx context.Context, session *registerSession, provider registerProvider, mailbox *registerMailbox, password string, profile registerProfileConfig) (map[string]any, error) {
+	email := strings.TrimSpace(mailbox.Address)
+	setup := s.signupBrowserFactory
+	if setup == nil {
+		setup = registerPendingInBrowser
+	}
+	tokens, err := setup(ctx, session, email, password, profile, func(ctx context.Context, notBefore time.Time) (string, error) {
+		mailbox.CodeNotBefore = notBefore
+		return provider.WaitForCode(ctx, mailbox)
+	})
+	// The saved candidate may belong to an interrupted registration and
+	// therefore be rejected by the login form. In that case use the
+	// mailbox-bound password reset flow before declaring the registration
+	// unrecoverable. Reset success is the only point at which the candidate
+	// becomes trusted for the subsequent MFA step.
+	if err != nil && isInvalidLoginPassword(err) {
+		reportAccountRepairProgress(ctx, "保存密码未生效，改用邮箱验证码重置密码")
+		resetTokens, resetErr := s.resetPendingRegisterPasswordForRepair(ctx, provider, mailbox, password, session.proxyRoute.URL)
+		if resetErr == nil {
+			session.passwordConfirmed = true
+			tokens, err = resetTokens, nil
+		} else {
+			err = fmt.Errorf("候选密码登录失败，邮箱重置密码也未完成: %w", resetErr)
+		}
+	}
+	if err == nil {
+		session.passwordConfirmed = session.passwordConfirmed || boolAny(tokens["password_confirmed"], false)
+	}
+	return tokens, err
+}
+
+func (s *registerService) completeRecoveredRegisterAccount(ctx context.Context, provider registerProvider, mailbox *registerMailbox, password string, tokens map[string]any, index int) error {
+	session, ok := provider.Session().(*registerSession)
+	if !ok {
+		return errors.New("注册会话不可用于设置 2FA")
+	}
+	email := strings.TrimSpace(mailbox.Address)
+	accessToken := strings.TrimSpace(strAny(tokens["access_token"], ""))
+	if accessToken == "" {
+		return errors.New("接续登录未返回 access_token")
+	}
+	record := map[string]any{
+		"access_token":    accessToken,
+		"refresh_token":   strAny(tokens["refresh_token"], ""),
+		"id_token":        strAny(tokens["id_token"], ""),
+		"email":           email,
+		"password":        password,
+		"password_status": "unverified",
+		"type":            "free",
+		"status":          "异常",
+		"mfa_status":      "pending",
+		"source_type":     "web",
+		"created_at":      nowISO(),
+	}
+	if session.passwordConfirmed {
+		record["password_status"] = "confirmed"
+	}
+	if mailbox.Password != "" {
+		record["email_password"] = mailbox.Password
+	}
+	for key, value := range mailbox.Extra {
+		if _, exists := record[key]; !exists {
+			record[key] = value
+		}
+	}
+	record["mailbox_provider"] = mailbox.Provider
+	record["mailbox_client_id"] = mailbox.ClientID
+	record["mailbox_refresh_token"] = firstNonEmpty(mailbox.RefreshToken, mailbox.Token)
+	if err := s.importRegisterAccount(record); err != nil {
+		return fmt.Errorf("接续登录成功但保存账号失败: %w", err)
+	}
+	if !session.passwordConfirmed {
+		var account Account
+		for _, item := range s.loadCurrentAccounts() {
+			if item.AccessToken == accessToken {
+				account = item
+				break
+			}
+		}
+		next, err := s.confirmRecoveredPassword(ctx, session, account, func(ctx context.Context, notBefore time.Time) (string, error) {
+			mailbox.CodeNotBefore = notBefore
+			return provider.WaitForCode(ctx, mailbox)
+		})
+		if err != nil {
+			_ = s.recordRecoveryEmail(email, "账号已入池，密码待确认")
+			return err
+		}
+		accessToken = next.AccessToken
+	}
+	if err := s.clearPendingPassword(email); err != nil {
+		s.appendLog(fmt.Sprintf("[任务%d] %s 账号已入池，清理待处理密码失败: %s", index, email, err), "red")
+	}
+	s.appendLog(fmt.Sprintf("[任务%d] %s 登录密码已确认，开始设置 2FA", index, email), "yellow")
+	if err := s.enableRegisterMFAWithFailover(ctx, session, accessToken, uuid4()); err != nil {
+		_ = s.recordRecoveryEmail(email, "账号已入池，2FA 待完成")
+		return fmt.Errorf("账号已入池但 2FA 未完成: %w", err)
+	}
+	if err := s.clearRecoveryEmail(email); err != nil {
+		s.appendLog(fmt.Sprintf("[任务%d] %s 2FA 已启用，清理待接续记录失败: %s", index, email, err), "red")
+	}
+	if s.server != nil {
+		if _, errs := s.server.refreshAccountInfos(ctx, []string{accessToken}); len(errs) > 0 {
+			s.appendLog(fmt.Sprintf("[任务%d] %s 账号已保存，刷新状态暂未成功: %s", index, email, strAny(errs[0]["error"], "未知错误")), "yellow")
+		}
+	}
+	s.appendLog(fmt.Sprintf("[任务%d] %s 已接续注册并保存 2FA", index, email), "green")
+	return nil
 }
 
 func isRegisterContextCanceled(err error) bool {
@@ -2657,7 +3193,7 @@ func (s *registerService) createProviderWithProxy(mail RegisterMailConfig, regis
 	case "cloudmail", "cloudmail_gen":
 		return &cloudMailGenRegisterProvider{registerProviderBase{sess: sess}, entry}, nil
 	case "icloud_api":
-		provider := &iCloudAPIRegisterProvider{registerProviderBase: registerProviderBase{sess: sess}, entry: entry}
+		provider := &iCloudAPIRegisterProvider{registerProviderBase: registerProviderBase{sess: sess}, entry: entry, service: s}
 		if !mail.APIUseRegisterProxy {
 			provider.mailSess, err = newRegisterSession("", mail.RequestTimeout, nil)
 			if err != nil {
@@ -2691,9 +3227,23 @@ func waitForRegisterCode(ctx context.Context, mailbox *registerMailbox, timeoutS
 	lastSkipped := 0
 	lastContent := 0
 	lastErr := ""
+	waitError := func(cause error) error {
+		parts := []string{fmt.Sprintf("最近轮询邮件%d封", lastCount)}
+		if lastSkipped > 0 {
+			parts = append(parts, fmt.Sprintf("跳过旧邮件%d封", lastSkipped))
+		}
+		parts = append(parts, fmt.Sprintf("有内容邮件%d封", lastContent))
+		if lastErr != "" {
+			parts = append(parts, "最近错误: "+lastErr)
+		}
+		if cause != nil {
+			return fmt.Errorf("等待邮箱验证码中断（%s）: %w", strings.Join(parts, "，"), cause)
+		}
+		return fmt.Errorf("等待注册验证码超时（%s）", strings.Join(parts, "，"))
+	}
 	for time.Now().Before(deadline) {
 		if err := ctx.Err(); err != nil {
-			return "", err
+			return "", waitError(err)
 		}
 		items, err := fetch()
 		if err == nil {
@@ -2726,18 +3276,10 @@ func waitForRegisterCode(ctx context.Context, mailbox *registerMailbox, timeoutS
 			lastErr = err.Error()
 		}
 		if !sleepContext(ctx, interval) {
-			return "", ctx.Err()
+			return "", waitError(ctx.Err())
 		}
 	}
-	parts := []string{fmt.Sprintf("最近轮询邮件%d封", lastCount)}
-	if lastSkipped > 0 {
-		parts = append(parts, fmt.Sprintf("跳过旧邮件%d封", lastSkipped))
-	}
-	parts = append(parts, fmt.Sprintf("有内容邮件%d封", lastContent))
-	if lastErr != "" {
-		parts = append(parts, "最近错误: "+lastErr)
-	}
-	return "", fmt.Errorf("等待注册验证码超时（%s）", strings.Join(parts, "，"))
+	return "", waitError(nil)
 }
 
 type cloudflareTempMailRegisterProvider struct {

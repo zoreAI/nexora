@@ -30,6 +30,7 @@ import {
   type ImageModel,
 } from "@/lib/api";
 import { useAuthGuard } from "@/lib/use-auth-guard";
+import { imageFileExtension, imageMimeType } from "@/lib/image-format";
 import {
   clearImageConversations,
   deleteImageConversation,
@@ -52,7 +53,7 @@ const IMAGE_RESOLUTION_STORAGE_KEY = "chatgpt2api:image_last_resolution";
 const IMAGE_COUNT_STORAGE_KEY = "chatgpt2api:image_last_count";
 const IMAGE_MODEL_STORAGE_KEY = "chatgpt2api:image_last_model";
 const HIGH_RESOLUTION_VALUES = new Set(["2k", "4k"]);
-const DEFAULT_IMAGE_MODELS: ImageModel[] = ["gpt-image-2", "gpt-image-2.5", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst"];
+const DEFAULT_IMAGE_MODELS: ImageModel[] = ["gpt-image-2", "gpt-image-2.5", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst", "gpt-image-2.6-sunburst", "gpt-image-2.6-flare"];
 const WEB_IMAGE_MODELS = new Set<string>(DEFAULT_IMAGE_MODELS);
 function isImageModel(value: string): value is ImageModel {
   return WEB_IMAGE_MODELS.has(value) || value === "codex-gpt-image-2" || value.endsWith("-codex-gpt-image-2");
@@ -130,9 +131,9 @@ function buildReferenceImageFromResult(image: StoredImage, fileName: string): St
   }
 
   return {
-    name: fileName,
-    type: "image/png",
-    dataUrl: `data:image/png;base64,${image.b64_json}`,
+    name: fileName.replace(/\.[^.]+$/, `.${imageFileExtension(imageMimeType(image))}`),
+    type: imageMimeType(image),
+    dataUrl: `data:${imageMimeType(image)};base64,${image.b64_json}`,
   };
 }
 

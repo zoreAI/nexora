@@ -24,7 +24,7 @@ func (s *Server) saveImageWithBaseURL(ctx context.Context, baseURL string, data 
 	s.maybeCleanupOldImages()
 	sum := md5.Sum(data)
 	relDir := filepath.Join(time.Now().Format("2006"), time.Now().Format("01"), time.Now().Format("02"))
-	name := fmt.Sprintf("%d_%x.png", time.Now().Unix(), sum)
+	name := fmt.Sprintf("%d_%x%s", time.Now().Unix(), sum, imageFileExtension(data))
 	rel := filepath.ToSlash(filepath.Join(relDir, name))
 	settings := s.imageStorageSettings()
 	if settings.Mode == "local" || settings.Mode == "both" || settings.Mode == "r2_both" {

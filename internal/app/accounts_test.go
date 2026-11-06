@@ -21,6 +21,57 @@ func TestMergeImportedTokenPreservesExistingAccountState(t *testing.T) {
 	}
 }
 
+func TestReimportSamePasswordPreservesAcceptedStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name, password, status, want string
+	}{
+		{"same password", "accepted-password", "", "confirmed"},
+		{"changed password", "different-candidate", "", "unverified"},
+		{"explicitly unverified", "accepted-password", "unverified", "unverified"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			password := "accepted-password"
+			current := Account{AccessToken: "saved-token", Password: &password, PasswordStatus: "confirmed"}
+			record := map[string]any{"password": tc.password}
+			if tc.status != "" {
+				record["password_status"] = tc.status
+			}
+			mergeImportedAccount(&current, accountFromRecord("saved-token", "web", record), record, false)
+			if current.PasswordStatus != tc.want || ptrString(current.Password) != tc.password {
+				t.Fatalf("password status=%s, want=%s", current.PasswordStatus, tc.want)
+			}
+		})
+	}
+}
+
+func TestImportFreshTokenPreservesPasswordEvidenceAcrossEmailMerge(t *testing.T) {
+	for _, tc := range []struct {
+		name, password, explicit, want string
+	}{
+		{"same password", "accepted-password", "", "confirmed"},
+		{"changed password", "new-candidate", "", "unverified"},
+		{"explicit unverified", "accepted-password", "unverified", "unverified"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			email, oldPassword := "user@example.com", "accepted-password"
+			record := map[string]any{"email": email, "password": tc.password}
+			if tc.explicit != "" {
+				record["password_status"] = tc.explicit
+			}
+			accounts := []Account{
+				{AccessToken: "old-token", Email: &email, Password: &oldPassword, PasswordStatus: "confirmed"},
+				accountFromRecord("refreshed-token", "web", record),
+			}
+			final := map[string]string{"import-token": "refreshed-token"}
+			preserveImportedPasswordEvidence(accounts, map[string]map[string]any{"import-token": record}, final)
+			got, merged := mergeImportedEmails(accounts, []string{"import-token"}, final, map[string]bool{"import-token": true}, nil)
+			if merged != 1 || len(got) != 1 || got[0].AccessToken != "refreshed-token" || got[0].PasswordStatus != tc.want || ptrString(got[0].Password) != tc.password {
+				t.Fatalf("fresh-token merge lost password evidence, want status=%s", tc.want)
+			}
+		})
+	}
+}
+
 func TestMergeImportedEmailsKeepsFreshTokenAndExistingCredentials(t *testing.T) {
 	oldEmail, newEmail := " User@Example.com ", "user@example.com"
 	password, secret := "login-password", "TOTPSECRET"

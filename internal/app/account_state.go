@@ -10,6 +10,10 @@ import (
 	"time"
 )
 
+func isAbnormalAccountStatus(status string) bool {
+	return status == "异常" || status == "封号"
+}
+
 func isRateLimitErrorText(err error) bool {
 	if err == nil {
 		return false
@@ -47,7 +51,10 @@ func isAccountDeactivatedError(err error) bool {
 		return false
 	}
 	text := strings.ToLower(err.Error())
-	return strings.Contains(text, "code=account_deactivated") || strings.Contains(text, `"code":"account_deactivated"`)
+	return strings.Contains(text, "code=account_deactivated") ||
+		strings.Contains(text, `"code":"account_deactivated"`) ||
+		strings.Contains(text, `"error":"account_deactivated"`) ||
+		strings.Contains(text, `"error": "account_deactivated"`)
 }
 
 func isAutoConversationModelNotFound(err error, model string) bool {
@@ -136,7 +143,9 @@ func (s *Server) markAccountSuccess(token string, image bool) {
 			if accounts[i].AccessToken != token {
 				continue
 			}
+			advanceAccountWindowStats(&accounts[i], time.Now())
 			accounts[i].Success++
+			accounts[i].WindowSuccess++
 			accounts[i].LastUsedAt = &now
 			if image && !accounts[i].ImageQuotaUnknown && accounts[i].Quota > 0 {
 				accounts[i].Quota--
@@ -163,7 +172,9 @@ func (s *Server) markAccountFailure(token string, err error, image bool, model s
 			if accounts[i].AccessToken != token {
 				continue
 			}
+			advanceAccountWindowStats(&accounts[i], time.Now())
 			accounts[i].Fail++
+			accounts[i].WindowFail++
 			accounts[i].LastUsedAt = &now
 			if accounts[i].Status == "封号" {
 				return accounts
@@ -198,7 +209,13 @@ func (s *Server) markAccountFailure(token string, err error, image bool, model s
 }
 
 func applyAccountFailureState(account *Account, err error, now string) {
+	statsAt, parseErr := parseAccountTime(now)
+	if parseErr != nil {
+		statsAt = time.Now()
+	}
+	advanceAccountWindowStats(account, statsAt)
 	account.Fail++
+	account.WindowFail++
 	account.LastUsedAt = &now
 	if isAccountDeactivatedError(err) {
 		account.Status = "封号"

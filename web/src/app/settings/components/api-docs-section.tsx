@@ -103,10 +103,10 @@ const docs: ApiDoc[] = [
     icon: FileArchive,
     input: [
       ["prompt", "string", "图片生成提示词。"],
-      ["model", "string", "可选，默认 gpt-image-2。"],
+      ["model", "string", "可选，默认 gpt-image-2，支持 gpt-image-2.6-sunburst / gpt-image-2.6-flare。"],
       ["n", "number", "可选，生成数量，当前限制 1-4。"],
       ["size", "string", "可选，支持 1024x1024、9:16、16:9 等。"],
-      ["resolution", "string", "可选，1k / 2k / 4k；2k/4k 走 Codex 图像链路。"],
+      ["resolution", "string", "可选，1k / 2k / 4k；gpt-image-2 的 2k/4k 走 Codex；指定 Web 版本模型时作为尺寸提示，实际尺寸由上游决定。"],
       ["response_format", "string", "可选，url 或 b64_json，默认 b64_json。"],
       ["stream", "boolean", "可选，是否流式返回。"],
     ],
@@ -128,6 +128,8 @@ const docs: ApiDoc[] = [
     icon: FileArchive,
     input: [
       ["image / images / image_url", "file | JSON", "参考图；支持 multipart 文件，也支持 JSON 中的 base64、data URL 或公网图片链接，最多 16 张。"],
+      ["markup", "PNG file | JSON", "可选；与首张参考图同尺寸的透明 PNG。JSON 支持 image_url、data URL 或 base64，不支持 file_id。Web 号池会将标注叠加到首张参考图供模型参考；不等同于上游原生 markup。不能与 mask 同时提交。"],
+      ["mask", "file | JSON", "当前 Web 号池不支持；提交时返回错误。"],
       ["prompt", "string", "编辑提示词。"],
       ["model", "string", "可选，默认 gpt-image-2。"],
       ["n", "number", "可选，生成数量，当前限制 1-4。"],
@@ -145,6 +147,7 @@ const docs: ApiDoc[] = [
   -F "model=gpt-image-2" \\
   -F "prompt=改成赛博朋克夜景" \\
   -F "image=@./input.png" \\
+  -F "markup=@./markup.png" \\
   -F "response_format=url"`,
   },
   {
@@ -222,6 +225,8 @@ const usableModels = [
   "gpt-image-2.5",
   "gpt-image-2.5-flare",
   "gpt-image-2.5-sunburst",
+  "gpt-image-2.6-sunburst",
+  "gpt-image-2.6-flare",
   "codex-gpt-image-2",
   "auto",
   "gpt-5-3",

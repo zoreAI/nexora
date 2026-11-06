@@ -29,6 +29,65 @@ func TestSelectAccountsForRefreshOnlyIncludesRequestedTokens(t *testing.T) {
 	}
 }
 
+func TestRefreshAllExcludesAbnormalAndBannedAccounts(t *testing.T) {
+	accounts := []Account{
+		{AccessToken: "normal", Status: "正常"},
+		{AccessToken: "abnormal", Status: "异常"},
+		{AccessToken: "banned", Status: "封号"},
+		{AccessToken: "limited", Status: "限流"},
+		{AccessToken: "disabled", Status: "禁用"},
+	}
+	selected, missing := selectAccountsForRefresh(accounts, nil)
+	if missing != 0 || len(selected) != 3 || selected[0].AccessToken != "normal" || selected[1].AccessToken != "limited" || selected[2].AccessToken != "disabled" {
+		t.Fatalf("unexpected refresh-all selection: %+v missing=%d", selected, missing)
+	}
+	selected, missing = selectAccountsForRefresh(accounts, []string{"abnormal", "banned"})
+	if missing != 0 || len(selected) != 2 {
+		t.Fatal("explicit refresh selection was changed by refresh-all filtering")
+	}
+}
+
+func TestRefreshAllRoutesSkipPoolContainingOnlyAbnormalAccounts(t *testing.T) {
+	s := &Server{cfg: Config{AuthKey: "admin-key"}, store: NewStore(t.TempDir())}
+	defer s.store.Close()
+	accounts := []Account{{AccessToken: "abnormal", Status: "异常"}, {AccessToken: "banned", Status: "封号"}}
+	if err := s.store.SaveAccounts(accounts); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name    string
+		handler http.HandlerFunc
+		status  int
+	}{
+		{"sync", s.handleAccountsRefresh, http.StatusOK},
+		{"async", s.handleAccountsRefreshStart, http.StatusBadRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/api/accounts/refresh", strings.NewReader(`{"access_tokens":[]}`))
+			req.Header.Set("Authorization", "Bearer admin-key")
+			rec := httptest.NewRecorder()
+			tc.handler(rec, req)
+			if rec.Code != tc.status {
+				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			if tc.name == "sync" {
+				var body struct {
+					Refreshed int              `json:"refreshed"`
+					Errors    []map[string]any `json:"errors"`
+				}
+				if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || body.Refreshed != 0 || len(body.Errors) != 0 {
+					t.Fatalf("excluded accounts were refreshed: %s", rec.Body.String())
+				}
+			}
+		})
+	}
+	for i, current := range s.store.LoadAccounts() {
+		if current.Status != accounts[i].Status || current.Fail != 0 || current.QuotaCheckedAt != "" {
+			t.Fatal("refresh-all changed an excluded account")
+		}
+	}
+}
+
 func TestAccountRefreshProgressReportsConcurrentResults(t *testing.T) {
 	jobs := &accountRefreshJobs{}
 	id, err := jobs.create(20)

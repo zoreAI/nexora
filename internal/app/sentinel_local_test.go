@@ -44,6 +44,19 @@ func TestLocalSentinelIdentityAndTokenValidation(t *testing.T) {
 	}
 }
 
+func TestChromeSentinelStartsWithIsolatedProfile(t *testing.T) {
+	if os.Getenv("NEXORA_TEST_CHROME") != "1" {
+		t.Skip("set NEXORA_TEST_CHROME=1 for the local Chrome startup fixture")
+	}
+	solver := &browserSentinelSolver{userAgent: upstreamUserAgent()}
+	defer solver.close()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := solver.ensurePage(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestLiveLocalSentinelHandshake(t *testing.T) {
 	if os.Getenv("CHATGPT2API_LIVE_SENTINEL") != "1" {
 		t.Skip("set CHATGPT2API_LIVE_SENTINEL=1 for an upstream handshake")

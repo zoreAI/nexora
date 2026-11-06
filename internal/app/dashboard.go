@@ -45,8 +45,10 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 			quota += account.Quota
 		}
 	}
+	pending := len(s.pendingRegisterAccountsFrom(accounts))
+	statuses["异常"] += pending
 	writeJSON(w, http.StatusOK, map[string]any{
-		"accounts": map[string]any{"total": len(accounts), "statuses": statuses, "remaining_quota": quota, "unknown_quota": unknownQuota},
+		"accounts": map[string]any{"total": len(accounts) + pending, "statuses": statuses, "remaining_quota": quota, "unknown_quota": unknownQuota},
 		"range":    rangeName,
 		"buckets":  s.logSvc.dashboardBuckets(rangeName, time.Now()),
 	})

@@ -5,6 +5,7 @@ import * as DialogPrimitive from "@radix-ui/react-dialog";
 import { Download, X } from "lucide-react";
 
 import { cn } from "@/lib/utils";
+import { imageFileExtension, imageMimeType } from "@/lib/image-format";
 
 type LightboxImage = {
   id: string;
@@ -211,7 +212,7 @@ export function ImageLightbox({
     if (!current) return;
     const link = document.createElement("a");
     link.href = current.src;
-    link.download = `image-${current.id}.png`;
+    link.download = `image-${current.id}.${imageFileExtension(imageMimeType({ url: current.src }))}`;
     link.click();
   }, [current]);
 

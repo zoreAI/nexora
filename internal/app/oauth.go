@@ -69,7 +69,7 @@ func (s *Server) refreshOAuthAccountAt(ctx context.Context, oldToken, tokenURL s
 	if idx < 0 || account.RefreshToken == nil || strings.TrimSpace(*account.RefreshToken) == "" {
 		return Account{}, fmt.Errorf("refresh_token not found")
 	}
-	client, err := s.newUpstreamClientForAccount(account)
+	client, err := s.newAccountLoginClient(ctx, account)
 	if err != nil {
 		return Account{}, err
 	}

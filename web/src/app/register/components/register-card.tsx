@@ -27,6 +27,7 @@ import { cn } from "@/lib/utils";
 import { fetchProxyGroups, type ProxyGroup } from "@/lib/api";
 
 import { useSettingsStore } from "../../settings/store";
+import { MihomoRegisterDialog } from "./mihomo-register-dialog";
 
 export function RegisterCard() {
   const config = useSettingsStore((state) => state.registerConfig);
@@ -454,6 +455,11 @@ export function RegisterCard() {
                 </SelectContent>
               </Select>
               {proxySelection === "fixed" ? <Input value={fixedProxy} onChange={(event) => { setFixedProxy(event.target.value); setProxy(event.target.value); }} placeholder="http://127.0.0.1:7890" className="h-10 rounded-lg border-border bg-background font-data text-[13px]" disabled={config.enabled} /> : null}
+              <MihomoRegisterDialog disabled={config.enabled || stats.running > 0} onApplied={(group, proxy) => {
+                setProxyGroups((current) => [...current.filter((item) => item.id !== group.id), group]);
+                setProxySelection(proxy);
+                setProxy(proxy);
+              }} />
               {proxySelection.startsWith("group:") ? <p className="text-xs text-muted-foreground">每个注册任务选一次节点，任务内保持同一出口。</p> : null}
             </div>
             <div className="space-y-1.5">

@@ -19,6 +19,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 import { cn } from "@/lib/utils";
+import { imageFileExtension, imageMimeType } from "@/lib/image-format";
 import type { ImageConversation, ImageTurnStatus, StoredImage, StoredReferenceImage } from "@/store/image-conversations";
 
 export type ImageLightboxItem = {
@@ -59,7 +60,7 @@ type ImageResultsProps = {
 
 function getStoredImageSrc(image: StoredImage) {
   if (image.b64_json) {
-    return `data:image/png;base64,${image.b64_json}`;
+    return `data:${imageMimeType(image)};base64,${image.b64_json}`;
   }
   return image.url || "";
 }
@@ -82,7 +83,7 @@ async function downloadStoredImage(image: StoredImage, index: number) {
     const binary = atob(image.b64_json);
     const bytes = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    blob = new Blob([bytes], { type: "image/png" });
+    blob = new Blob([bytes], { type: imageMimeType(image) });
   } else if (image.url) {
     const res = await fetch(image.url);
     blob = await res.blob();
@@ -92,7 +93,7 @@ async function downloadStoredImage(image: StoredImage, index: number) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  a.download = `image-${index + 1}.png`;
+  a.download = `image-${index + 1}.${imageFileExtension(blob.type || imageMimeType(image))}`;
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);

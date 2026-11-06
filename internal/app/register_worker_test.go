@@ -667,6 +667,26 @@ func TestRegisterLoadKeepsEnabledState(t *testing.T) {
 	}
 }
 
+func TestRegisterLoadClearsStaleRunningCountWhenStopped(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "register.json")
+	raw := `{"enabled":false,"threads":5,"stats":{"job_id":"old-job","job_kind":"repair_abnormal","running":2,"success":3,"fail":1},"pending_passwords":[{"email":"pending@example.com","password":"secret","state":"awaiting_manual_repair"}]}`
+	if err := os.WriteFile(path, []byte(raw), 0644); err != nil {
+		t.Fatalf("write register config: %v", err)
+	}
+	svc := &registerService{path: path}
+	if err := svc.load(); err != nil {
+		t.Fatalf("load error: %v", err)
+	}
+	snapshot := svc.snapshot()
+	if snapshot.Stats.Running != 0 {
+		t.Fatalf("running = %d, want stale count cleared", snapshot.Stats.Running)
+	}
+	if snapshot.Stats.Success != 3 || snapshot.Stats.Fail != 1 || len(snapshot.PendingPasswords) != 1 {
+		t.Fatalf("completed or pending data was changed: stats=%+v pending=%d", snapshot.Stats, len(snapshot.PendingPasswords))
+	}
+}
+
 func TestMaybeStartRegisterAutoStartsEnabledConfig(t *testing.T) {
 	svc := &registerService{path: t.TempDir() + "/register.json", cfg: defaultRegisterConfig()}
 	svc.cfg.Enabled = true
@@ -985,6 +1005,21 @@ func TestContinueURLFromCreateAccountResponse(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "registration_disallowed") || !strings.Contains(err.Error(), "request_id=req-1") {
 		t.Fatalf("unexpected auth error: %v", err)
+	}
+}
+
+func TestIdentityVerificationIsReportedWithoutMissingCallback(t *testing.T) {
+	for _, body := range []string{
+		`{"continue_url":"https://auth.openai.com/verify-your-identity?private=secret"}`,
+		`{"page":{"type":"identity_verification"}}`,
+	} {
+		got, err := continueURLFromResponse(&http.Response{Header: make(http.Header)}, body)
+		if got != "" || err == nil || !strings.Contains(err.Error(), "需要手动完成身份验证") || strings.Contains(err.Error(), "secret") {
+			t.Fatalf("invalid identity-verification result: %q %v", got, err)
+		}
+	}
+	if err := registerIdentityVerificationError("https://other.example/verify-your-identity"); err != nil {
+		t.Fatal("trusted a different origin")
 	}
 }
 

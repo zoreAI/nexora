@@ -4,7 +4,6 @@ import (
 	"context"
 	"net/http"
 	"strings"
-	"time"
 )
 
 func selectAbnormalAccounts(accounts []Account, tokens []string) []Account {
@@ -32,61 +31,59 @@ func (s *Server) handleAccountsRepairStart(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	var body struct {
-		AccessTokens []string `json:"access_tokens"`
+		AccessTokens   []string `json:"access_tokens"`
+		RecoveryEmails []string `json:"recovery_emails"`
+		RetryBlocked   bool     `json:"retry_blocked"`
 	}
 	if !readBody(w, r, &body) {
 		return
 	}
 	selected := selectAbnormalAccounts(s.store.LoadAccounts(), body.AccessTokens)
-	if len(selected) == 0 {
+	pending := s.selectPendingRegisterEmails(body.RecoveryEmails, body.RetryBlocked)
+	skipped := len(s.selectPendingRegisterEmails(body.RecoveryEmails, true)) - len(pending)
+	if len(selected)+len(pending) == 0 {
+		if skipped > 0 {
+			writeErr(w, http.StatusBadRequest, "所选待接续账号需要人工处理，请查看号池中的原因，处理后单条重新检查")
+			return
+		}
 		writeErr(w, http.StatusBadRequest, "请选择异常账号")
 		return
 	}
-	id, err := s.accountRepairJobs.create(len(selected))
+	targets := accountRepairTargets(selected, pending)
+	id, err := s.accountRepairJobs.create(len(targets))
 	if err != nil {
 		writeErr(w, http.StatusTooManyRequests, err.Error())
 		return
 	}
-	go s.runAccountRepairJob(context.WithoutCancel(r.Context()), id, selected)
-	writeJSON(w, http.StatusAccepted, map[string]any{"progress_id": id, "total": len(selected)})
+	go s.runAccountRepairJob(context.WithoutCancel(r.Context()), id, selected, pending)
+	writeJSON(w, http.StatusAccepted, map[string]any{"progress_id": id, "total": len(targets), "skipped": skipped})
 }
 
-func (s *Server) runAccountRepairJob(ctx context.Context, id string, accounts []Account) {
+func (s *Server) runAccountRepairJob(ctx context.Context, id string, accounts []Account, pendingEmails []string) {
 	defer s.accountRepairJobs.finish(id)
-	for _, account := range accounts {
-		current := Account{}
-		for _, item := range s.store.LoadAccounts() {
-			if item.AccessToken == account.AccessToken {
-				current = item
-				break
-			}
+	if err := s.ensureAccountRepairMihomo(ctx); err != nil {
+		for _, target := range accountRepairTargets(accounts, pendingEmails) {
+			s.accountRepairJobs.record(id, &accountRefreshFailure{Account: firstNonEmpty(target.email, "账号"), Error: "准备 Mihomo 修复代理失败: " + err.Error()})
 		}
-		label := firstNonEmpty(ptrString(account.Email), "账号")
-		if current.AccessToken == "" || current.Status != "异常" {
-			s.accountRepairJobs.record(id, &accountRefreshFailure{Account: label, Error: "账号已删除或状态已变化"})
-			continue
-		}
-		itemCtx, cancel := context.WithTimeout(ctx, 180*time.Second)
-		repaired, skipped, errs, skippedItems := s.reLoginAccounts(itemCtx, []string{current.AccessToken})
-		cancel()
-		if repaired > 0 {
+		return
+	}
+	mail := RegisterMailConfig{}
+	if s.register != nil {
+		mail = s.register.snapshot().Mail
+	}
+	runAccountRepairTargets(ctx, accountRepairTargets(accounts, pendingEmails), s.accountRepairThreads(), accountRepairTimeout(mail), s.repairAccountTarget, nil, func(item accountRepairTarget, _ int, err error) {
+		if err == nil {
 			s.accountRepairJobs.record(id, nil)
-			continue
+			return
 		}
-		message := "账号缺少可用的重新授权方式"
-		if skipped > 0 && len(skippedItems) > 0 {
-			message = strAny(skippedItems[0]["reason"], message)
-		}
-		if len(errs) > 0 {
-			message = strAny(errs[0]["error"], message)
-		}
-		for _, secret := range []string{current.AccessToken, ptrString(current.Password), ptrString(current.MFASecret), ptrString(current.RefreshToken), ptrString(current.IDToken), current.Proxy, s.cfg.Proxy} {
+		message := err.Error()
+		for _, secret := range []string{item.account.AccessToken, ptrString(item.account.Password), ptrString(item.account.MFASecret), ptrString(item.account.RefreshToken), ptrString(item.account.IDToken), item.account.Proxy, s.cfg.Proxy} {
 			if secret != "" {
 				message = strings.ReplaceAll(message, secret, "[redacted]")
 			}
 		}
-		s.accountRepairJobs.record(id, &accountRefreshFailure{Account: label, Error: truncateText(message, 500)})
-	}
+		s.accountRepairJobs.record(id, &accountRefreshFailure{Account: firstNonEmpty(item.email, "账号"), Error: truncateText(message, 500)})
+	})
 }
 
 func (s *Server) handleAccountsRepairProgress(w http.ResponseWriter, r *http.Request) {

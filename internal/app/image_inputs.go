@@ -34,6 +34,7 @@ type imageEditRequest struct {
 	Resolution     string
 	ResponseFormat string
 	Inputs         [][]byte
+	Markup         []byte
 }
 
 var imageFetchSlots = make(chan struct{}, 8)
@@ -82,6 +83,12 @@ func parseJSONImageEditBody(ctx context.Context, body map[string]any) (imageEdit
 		Resolution:     strings.TrimSpace(strAny(body["resolution"], "")),
 		ResponseFormat: strings.TrimSpace(strAny(body["response_format"], "")),
 	}
+	if _, hasMask := body["mask"]; hasMask {
+		if _, hasMarkup := body["markup"]; hasMarkup {
+			return imageEditRequest{}, errors.New("markup and mask cannot be combined")
+		}
+		return imageEditRequest{}, errors.New("mask is not supported by the ChatGPT Web image route")
+	}
 	var sources []any
 	for _, key := range []string{"images", "image", "image_url"} {
 		if value, ok := body[key]; ok {
@@ -107,6 +114,12 @@ func parseJSONImageEditBody(ctx context.Context, body map[string]any) (imageEdit
 	}
 	if err := validateImageInputSet(request.Inputs); err != nil {
 		return imageEditRequest{}, err
+	}
+	if markup, ok := body["markup"]; ok {
+		request.Markup, err = readMarkupSource(ctx, markup)
+		if err != nil {
+			return imageEditRequest{}, err
+		}
 	}
 	return request, nil
 }
@@ -138,6 +151,21 @@ func parseMultipartImageEditRequest(r *http.Request) (imageEditRequest, error) {
 	if r.MultipartForm == nil {
 		return imageEditRequest{}, errors.New("image file is required")
 	}
+	if _, hasMaskFile := r.MultipartForm.File["mask"]; hasMaskFile {
+		if _, hasMarkupFile := r.MultipartForm.File["markup"]; hasMarkupFile {
+			return imageEditRequest{}, errors.New("markup and mask cannot be combined")
+		}
+		return imageEditRequest{}, errors.New("mask is not supported by the ChatGPT Web image route")
+	}
+	if _, hasMaskField := r.MultipartForm.Value["mask"]; hasMaskField {
+		if _, hasMarkupFile := r.MultipartForm.File["markup"]; hasMarkupFile {
+			return imageEditRequest{}, errors.New("markup and mask cannot be combined")
+		}
+		if _, hasMarkupField := r.MultipartForm.Value["markup"]; hasMarkupField {
+			return imageEditRequest{}, errors.New("markup and mask cannot be combined")
+		}
+		return imageEditRequest{}, errors.New("mask is not supported by the ChatGPT Web image route")
+	}
 	for _, key := range []string{"image", "image[]"} {
 		for _, header := range r.MultipartForm.File[key] {
 			file, err := header.Open()
@@ -158,7 +186,44 @@ func parseMultipartImageEditRequest(r *http.Request) (imageEditRequest, error) {
 	if err := validateImageInputSet(request.Inputs); err != nil {
 		return imageEditRequest{}, err
 	}
+	if files := r.MultipartForm.File["markup"]; len(files) > 0 {
+		if len(files) != 1 || len(r.MultipartForm.Value["markup"]) > 0 {
+			return imageEditRequest{}, errors.New("exactly one markup image is allowed")
+		}
+		file, err := files[0].Open()
+		if err != nil {
+			return imageEditRequest{}, fmt.Errorf("open markup file: %w", err)
+		}
+		request.Markup, err = readLimitedImage(file)
+		closeErr := file.Close()
+		if err != nil {
+			return imageEditRequest{}, err
+		}
+		if closeErr != nil {
+			return imageEditRequest{}, fmt.Errorf("close markup file: %w", closeErr)
+		}
+	} else if values := r.MultipartForm.Value["markup"]; len(values) > 0 {
+		if len(values) != 1 {
+			return imageEditRequest{}, errors.New("exactly one markup image is allowed")
+		}
+		request.Markup, err = readMarkupSource(r.Context(), values[0])
+		if err != nil {
+			return imageEditRequest{}, err
+		}
+	}
 	return request, nil
+}
+
+func readMarkupSource(ctx context.Context, source any) ([]byte, error) {
+	remaining, total := 1, 0
+	images, err := readImageSource(ctx, source, &remaining, &total)
+	if err != nil {
+		return nil, fmt.Errorf("markup: %w", err)
+	}
+	if len(images) != 1 {
+		return nil, errors.New("markup must contain exactly one image")
+	}
+	return images[0], nil
 }
 
 func parseImageCount(raw any) (int, error) {

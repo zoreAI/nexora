@@ -68,6 +68,7 @@ func (s *Server) imageResult(w http.ResponseWriter, r *http.Request, id *Identit
 		writeErr(w, 502, err.Error())
 		return
 	}
+	imageUsages := make([]map[string]any, 0, n)
 	data, saveErr := collectSavedImageResults(items, n, func(result upstreamImageResult) (map[string]any, error) {
 		rel, url, err := s.saveImage(r, result.Bytes)
 		if err != nil {
@@ -79,6 +80,7 @@ func (s *Server) imageResult(w http.ResponseWriter, r *http.Request, id *Identit
 		if responseFormat == "b64_json" || responseFormat == "" {
 			item["b64_json"] = base64.StdEncoding.EncodeToString(result.Bytes)
 		}
+		imageUsages = append(imageUsages, imageUsageOrEstimate(result.Usage, prompt, model, size, resolution, refs, result.Bytes))
 		return item, nil
 	})
 	s.refundImage(id, n-len(data))
@@ -101,7 +103,80 @@ func (s *Server) imageResult(w http.ResponseWriter, r *http.Request, id *Identit
 		}
 	}
 	s.logCallSuccess(callID, endpoint, model, action, logFields)
-	writeJSON(w, 200, map[string]any{"created": time.Now().Unix(), "data": data})
+	response := map[string]any{"created": time.Now().Unix(), "data": data}
+	if usage := aggregateImageUsage(imageUsages); usage != nil {
+		for _, item := range imageUsages {
+			if boolAny(item["estimated"], false) {
+				response["usage_estimated"] = true
+				response["usage_estimation_method"] = imageUsageEstimateMethod
+				response["usage_text_tokenizer"] = strAny(item["text_tokenizer"], "")
+				break
+			}
+		}
+		if official := officialImageUsage(usage); official != nil {
+			response["usage"] = official
+		}
+	}
+	writeJSON(w, 200, response)
+}
+
+func aggregateImageUsage(usages []map[string]any) map[string]any {
+	if len(usages) == 0 {
+		return nil
+	}
+	for _, usage := range usages {
+		if len(usage) == 0 {
+			return nil
+		}
+	}
+	if len(usages) == 1 {
+		return usages[0]
+	}
+	result := map[string]any{}
+	for _, key := range []string{"input_tokens", "output_tokens", "total_tokens", "prompt_tokens", "completion_tokens"} {
+		if sum, ok := sumImageUsageField(usages, key); ok {
+			result[key] = sum
+		}
+	}
+	for _, detailKey := range []string{"input_tokens_details", "output_tokens_details", "prompt_tokens_details", "completion_tokens_details"} {
+		details := map[string]any{}
+		for _, field := range []string{"cached_tokens", "reasoning_tokens", "text_tokens", "image_tokens"} {
+			all := make([]map[string]any, 0, len(usages))
+			for _, usage := range usages {
+				detail, _ := usage[detailKey].(map[string]any)
+				all = append(all, detail)
+			}
+			if sum, ok := sumImageUsageField(all, field); ok {
+				details[field] = sum
+			}
+		}
+		if len(details) > 0 {
+			result[detailKey] = details
+		}
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
+func sumImageUsageField(usages []map[string]any, field string) (int, bool) {
+	sum := 0
+	for _, usage := range usages {
+		if usage == nil {
+			return 0, false
+		}
+		value, ok := usage[field]
+		if !ok {
+			return 0, false
+		}
+		count := intAny(value, -1)
+		if count < 0 {
+			return 0, false
+		}
+		sum += count
+	}
+	return sum, true
 }
 
 func collectSavedImageResults(items []upstreamImageResult, limit int, save func(upstreamImageResult) (map[string]any, error)) ([]map[string]any, error) {
@@ -157,6 +232,14 @@ func (s *Server) handleV1ImagesEdits(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeErr(w, 400, err.Error())
 		return
+	}
+	if len(parsed.Markup) > 0 {
+		parsed.Inputs, err = applyImageMarkup(parsed.Inputs, parsed.Markup)
+		if err != nil {
+			writeErr(w, 400, err.Error())
+			return
+		}
+		parsed.Prompt += "\n\nThe first reference image contains markup overlaid on the source. Use the markup only to guide the edit; do not reproduce annotation marks in the final image."
 	}
 	s.imageResult(w, r, id, parsed.Prompt, parsed.Model, parsed.Size, parsed.Resolution, parsed.ResponseFormat, parsed.N, true, parsed.Inputs)
 }
@@ -742,6 +825,8 @@ func (s *Server) imageResultStream(w http.ResponseWriter, r *http.Request, id *I
 		s.recordOwner(id, rel)
 		s.recordPrompt(rel, prompt, isEdit)
 		return map[string]any{"url": url, "b64_json": base64.StdEncoding.EncodeToString(result.Bytes), "revised_prompt": firstNonEmpty(result.RevisedPrompt, prompt)}, nil
+	}, func(result upstreamImageResult) map[string]any {
+		return imageUsageOrEstimate(result.Usage, prompt, model, size, resolution, refs, result.Bytes)
 	})
 	s.refundImage(id, n-succeeded)
 	logFields := map[string]any{"n": n, "image_count": succeeded}
@@ -760,7 +845,7 @@ func (s *Server) imageResultStream(w http.ResponseWriter, r *http.Request, id *I
 	sseDone(w)
 }
 
-func streamImageSlots(w http.ResponseWriter, ctx context.Context, model string, created int64, n int, generate func() ([]upstreamImageResult, error), save func(upstreamImageResult) (map[string]any, error)) (int, error) {
+func streamImageSlots(w http.ResponseWriter, ctx context.Context, model string, created int64, n int, generate func() ([]upstreamImageResult, error), save func(upstreamImageResult) (map[string]any, error), usageFor ...func(upstreamImageResult) map[string]any) (int, error) {
 	succeeded := 0
 	var firstErr error
 	for i := 0; i < n; i++ {
@@ -793,7 +878,20 @@ func streamImageSlots(w http.ResponseWriter, ctx context.Context, model string, 
 			break
 		}
 		succeeded++
-		sse(w, map[string]any{"object": "image.generation.result", "created": created, "model": model, "index": i, "total": n, "data": []map[string]any{item}})
+		event := map[string]any{"object": "image.generation.result", "created": created, "model": model, "index": i, "total": n, "data": []map[string]any{item}}
+		if len(usageFor) > 0 {
+			if usage := usageFor[0](items[0]); usage != nil {
+				if boolAny(usage["estimated"], false) {
+					event["usage_estimated"] = true
+					event["usage_estimation_method"] = imageUsageEstimateMethod
+					event["usage_text_tokenizer"] = strAny(usage["text_tokenizer"], "")
+				}
+				if official := officialImageUsage(usage); official != nil {
+					event["usage"] = official
+				}
+			}
+		}
+		sse(w, event)
 	}
 	return succeeded, firstErr
 }
@@ -1464,7 +1562,14 @@ func buildChatImageMarkdown(data []map[string]any) string {
 			continue
 		}
 		if b64 := strings.TrimSpace(strAny(item["b64_json"], "")); b64 != "" {
-			parts = append(parts, fmt.Sprintf("![image_%d](data:image/png;base64,%s)", i+1, b64))
+			mimeType := "image/png"
+			if data, err := base64.StdEncoding.DecodeString(b64); err == nil {
+				mimeType = http.DetectContentType(data)
+				if !strings.HasPrefix(mimeType, "image/") {
+					mimeType = "image/png"
+				}
+			}
+			parts = append(parts, fmt.Sprintf("![image_%d](data:%s;base64,%s)", i+1, mimeType, b64))
 		}
 	}
 	if len(parts) == 0 {

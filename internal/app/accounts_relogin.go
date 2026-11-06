@@ -38,7 +38,7 @@ func (s *Server) handleAccountMFALogin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "仅支持已保存邮箱、密码和 2FA 密钥的异常账号")
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 180*time.Second)
 	defer cancel()
 	next, err := s.reLoginAccountWithPasswordSecret(ctx, *account, ptrString(account.MFASecret))
 	if err != nil {
@@ -68,22 +68,47 @@ func (s *Server) reLoginAccountWithPassword(ctx context.Context, old Account) (A
 	return s.reLoginAccountWithPasswordSecret(ctx, old, "")
 }
 
+func (s *Server) newAccountLoginSession(proxy string, timeout int) (*registerSession, error) {
+	if s.accountLoginSessionFactory != nil {
+		return s.accountLoginSessionFactory(proxy, timeout)
+	}
+	return newRegisterSession(proxy, timeout, s.ensureCurlImpersonateBinary)
+}
+
 func (s *Server) reLoginAccountWithPasswordSecret(ctx context.Context, old Account, mfaSecret string) (Account, error) {
 	email := ptrString(old.Email)
 	password := ptrString(old.Password)
 	if email == "" || password == "" {
 		return Account{}, errors.New("账号缺少邮箱或密码")
 	}
-	proxyURL, err := s.selectedProxyForAccount(old)
+	route, err := s.accountLoginProxyRoute(ctx, old)
 	if err != nil {
 		return Account{}, err
 	}
-	session, err := newRegisterSession(proxyURL, 45, s.ensureCurlImpersonateBinary)
+	session, err := s.newAccountLoginSession(route.URL, 45)
 	if err != nil {
 		return Account{}, err
 	}
 	defer session.close()
-	tokens, err := session.loginWithPassword(ctx, email, password, mfaSecret, func(ctx context.Context, codeNotBefore time.Time) (string, error) {
+	session.proxyRoute = route
+	// A legacy registration record may have been marked confirmed before the
+	// account/profile step actually completed. When a pending/recovery marker is
+	// still present, treat the stored password as a candidate and keep the email
+	// OTP fallback available after a failed password attempt.
+	recoveryCandidate := false
+	if s.register != nil {
+		recoveryCandidate = s.register.hasRecoveryEmail(email) || s.register.pendingPasswordForEmail(email) != ""
+	}
+	session.allowPasswordlessFallback = (old.PasswordStatus != "confirmed" || recoveryCandidate) && s.canReadAccountEmailCode(old)
+	var profile *registerProfileConfig
+	if s.register != nil && (old.MFAStatus == "pending" || old.MFAStatus == "failed" || s.register.hasRecoveryEmail(email) || s.register.pendingPasswordForEmail(email) != "") {
+		cfg := s.register.snapshot()
+		profile = &registerProfileConfig{Name: cfg.ProfileName, Birthdate: cfg.ProfileBirthdate}
+	}
+	tokens, err := session.loginWithPasswordContinuation(ctx, email, password, mfaSecret, profile, func(ctx context.Context, codeNotBefore time.Time) (string, error) {
+		if !s.canReadAccountEmailCode(old) {
+			return "", errors.New("账号没有可用的邮箱验证码读取方式，请检查原邮箱 provider 配置")
+		}
 		return s.waitAccountEmailCode(ctx, session, old, email, ptrString(old.EmailPassword), codeNotBefore)
 	})
 	if err != nil {
@@ -97,8 +122,18 @@ func (s *Server) reLoginAccountWithPasswordSecret(ctx context.Context, old Accou
 	idToken := strings.TrimSpace(strAny(tokens["id_token"], ""))
 	now := nowISO()
 	next := old
+	if session.passwordConfirmed {
+		next.PasswordStatus = "confirmed"
+	} else {
+		// Email login supplies no new password evidence. Preserve a prior
+		// successful confirmation, but never upgrade a legacy candidate.
+		next.PasswordStatus = normalizePasswordStatus(old.PasswordStatus)
+	}
 	next.AccessToken = accessToken
 	next.Status = "正常"
+	if _, repairing := ctx.Value(accountRepairProxyKey{}).(accountRepairProxy); repairing && next.PasswordStatus != "confirmed" {
+		next.Status = "异常"
+	}
 	next.SourceType = firstNonEmpty(strings.TrimSpace(next.SourceType), "password")
 	next.RateLimitedAt = nil
 	next.RateLimitResetAt = nil
@@ -128,16 +163,19 @@ func (s *Server) reLoginAccountWithEmailCode(ctx context.Context, old Account) (
 	if email == "" || !s.canReadAccountEmailCode(old) {
 		return Account{}, errors.New("账号缺少邮箱或可用的邮箱验证码读取方式")
 	}
-	proxyURL, err := s.selectedProxyForAccount(old)
+	route, err := s.accountLoginProxyRoute(ctx, old)
 	if err != nil {
 		return Account{}, err
 	}
-	session, err := newRegisterSession(proxyURL, 60, s.ensureCurlImpersonateBinary)
+	session, err := s.newAccountLoginSession(route.URL, 60)
 	if err != nil {
 		return Account{}, err
 	}
 	defer session.close()
+	session.proxyRoute = route
 	deviceID := uuid4()
+	codeNotBefore := time.Now().UTC().Truncate(time.Second)
+	reportAccountRepairProgress(ctx, "开始邮箱验证码授权")
 	codeVerifier, err := session.platformAuthorizeWithHint(ctx, deviceID, email, "login")
 	if err != nil {
 		codeVerifier, err = session.platformAuthorizeWithHint(ctx, deviceID, email, "login_or_signup")
@@ -152,14 +190,16 @@ func (s *Server) reLoginAccountWithEmailCode(ctx context.Context, old Account) (
 	} else if !strings.HasPrefix(session.lastAuthorizeLanding, "verification path=") {
 		return Account{}, fmt.Errorf("授权未进入邮箱验证码步骤: %s", session.lastAuthorizeLanding)
 	}
-	codeNotBefore := time.Now().UTC()
+	reportAccountRepairProgress(ctx, "请求邮箱验证码")
 	if err := session.sendOTP(ctx, deviceID); err != nil {
 		return Account{}, err
 	}
+	reportAccountRepairProgress(ctx, "等待邮箱验证码")
 	code, err := s.waitAccountEmailCode(ctx, session, old, email, emailPassword, codeNotBefore)
 	if err != nil {
 		return Account{}, err
 	}
+	reportAccountRepairProgress(ctx, "校验邮箱验证码")
 	continueURL, err := session.validateOTPContinueURL(ctx, deviceID, code)
 	if err != nil {
 		return Account{}, err
@@ -168,6 +208,7 @@ func (s *Server) reLoginAccountWithEmailCode(ctx context.Context, old Account) (
 	if oauthCode == "" {
 		return Account{}, errors.New("邮箱验证码已校验，但未返回 oauth callback code")
 	}
+	reportAccountRepairProgress(ctx, "获取登录令牌")
 	tokens, err := session.exchangeTokens(ctx, codeVerifier, oauthCode)
 	if err != nil {
 		return Account{}, err
@@ -180,6 +221,9 @@ func (s *Server) reLoginAccountWithEmailCode(ctx context.Context, old Account) (
 	idToken := strings.TrimSpace(strAny(tokens["id_token"], ""))
 	now := nowISO()
 	next := old
+	if ptrString(next.Password) != "" {
+		next.PasswordStatus = normalizePasswordStatus(old.PasswordStatus)
+	}
 	next.AccessToken = accessToken
 	next.Status = "正常"
 	next.SourceType = firstNonEmpty(strings.TrimSpace(next.SourceType), "email_code")
@@ -384,7 +428,7 @@ func (s *Server) reLoginAccounts(ctx context.Context, tokens []string) (int, int
 			})
 			continue
 		}
-		itemCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+		itemCtx, cancel := context.WithTimeout(ctx, 180*time.Second)
 		next, err := s.reLoginAccountWithPasswordSecret(itemCtx, accounts[i], ptrString(accounts[i].MFASecret))
 		cancel()
 		if err != nil {
@@ -404,6 +448,9 @@ func (s *Server) reLoginAccounts(ctx context.Context, tokens []string) (int, int
 }
 
 func (s *Server) recordReLoginFailure(token string, failure error) error {
+	if errors.Is(failure, context.Canceled) {
+		return nil
+	}
 	return s.store.UpdateAccounts(func(accounts []Account) []Account {
 		for i := range accounts {
 			if accounts[i].AccessToken == token {
@@ -423,8 +470,14 @@ func (s *Server) persistReLoginAccount(oldToken string, next Account) error {
 				continue
 			}
 			current := accounts[i]
+			if ptrString(current.Password) == ptrString(next.Password) && next.PasswordStatus != "" {
+				current.PasswordStatus = normalizePasswordStatus(next.PasswordStatus)
+			}
 			current.AccessToken = next.AccessToken
 			current.Status = next.Status
+			if next.Status == "正常" && (current.MFAStatus == "pending" || current.MFAStatus == "failed") {
+				current.Status = "异常"
+			}
 			current.SourceType = next.SourceType
 			current.RateLimitedAt = next.RateLimitedAt
 			current.RateLimitResetAt = next.RateLimitResetAt

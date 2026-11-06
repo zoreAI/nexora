@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -19,6 +21,37 @@ type mfaRoundTripper func(*http.Request) (*http.Response, error)
 
 func (fn mfaRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) { return fn(req) }
 
+func TestMFAFailurePreservesAccountClassification(t *testing.T) {
+	for _, tc := range []struct {
+		name, code, wantStatus string
+		status                 int
+	}{
+		{"expired", "token_expired", "异常", 401},
+		{"deactivated", "account_deactivated", "封号", 403},
+		{"temporary", "server_error", "异常", 503},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := pendingRecoveryTestServer(t)
+			password := "saved-password"
+			if err := s.store.SaveAccounts([]Account{{AccessToken: "saved-token", Password: &password, Status: "正常", MFAStatus: "failed"}}); err != nil {
+				t.Fatal(err)
+			}
+			session := &registerSession{client: &http.Client{Transport: mfaRoundTripper(func(*http.Request) (*http.Response, error) {
+				body := fmt.Sprintf(`{"error":{"code":%q},"secret":"must-not-leak","session_id":"must-not-leak"}`, tc.code)
+				return &http.Response{StatusCode: tc.status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
+			})}}
+			err := s.register.enableRegisterMFA(context.Background(), session, "saved-token", "device")
+			got := s.store.LoadAccounts()[0]
+			if err == nil || strings.Contains(err.Error(), "must-not-leak") || got.Status != tc.wantStatus || got.MFAStatus != "failed" || ptrString(got.Password) != password || got.AccessToken != "saved-token" {
+				t.Fatalf("incorrect MFA failure handling: err=%v status=%s mfa=%s", err, got.Status, got.MFAStatus)
+			}
+			if tc.code == "account_deactivated" && !isAccountDeactivatedError(err) {
+				t.Fatal("deactivation code was lost")
+			}
+		})
+	}
+}
+
 func TestRegisterTOTP(t *testing.T) {
 	code, err := registerTOTP("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ", time.Unix(59, 0))
 	if err != nil || code != "287082" {
@@ -26,6 +59,164 @@ func TestRegisterTOTP(t *testing.T) {
 	}
 	if _, err := registerTOTP("invalid!", time.Now()); err == nil {
 		t.Fatal("invalid secret accepted")
+	}
+}
+
+func TestUnsupportedCountryIsEligibleForProxyFailover(t *testing.T) {
+	if !isTransientRegisterNetworkError(errors.New(`GET authorize failed: status=403 code=unsupported_country_region_territory`)) {
+		t.Fatal("unsupported country rejection should rotate the egress proxy")
+	}
+}
+
+func TestRegisterMFAEnrollmentSwitchesProxyAfterConnectionReset(t *testing.T) {
+	store := NewStore(t.TempDir())
+	defer store.Close()
+	group, err := store.SaveProxyGroup(proxyGroupInput{Name: "register", Strategy: "round_robin", Nodes: []proxyNodeInput{
+		{URL: "http://127.0.0.1:7801"}, {URL: "http://127.0.0.1:7802"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveAccounts([]Account{{AccessToken: "token", Status: "异常", MFAStatus: "pending"}}); err != nil {
+		t.Fatal(err)
+	}
+	firstCalls, secondCalls := 0, 0
+	first := &registerSession{
+		proxyRoute: proxyRoute{URL: group.Nodes[0].URL, NodeID: group.Nodes[0].ID},
+		client: &http.Client{Transport: mfaRoundTripper(func(*http.Request) (*http.Response, error) {
+			firstCalls++
+			return nil, syscall.ECONNRESET
+		})},
+	}
+	svc := &registerService{store: store, server: &Server{store: store}, cfg: RegisterConfig{Proxy: "group:" + group.ID}}
+	svc.mfaSessionFactory = func(proxyURL string) (*registerSession, error) {
+		if proxyURL != group.Nodes[1].URL {
+			t.Fatalf("fallback proxy=%q", proxyURL)
+		}
+		return &registerSession{client: &http.Client{Transport: mfaRoundTripper(func(req *http.Request) (*http.Response, error) {
+			secondCalls++
+			response := `{"secret":"GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ","session_id":"session"}`
+			if strings.HasSuffix(req.URL.Path, "/activate_enrollment") {
+				response = `{"success":true}`
+			}
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(response)), Header: http.Header{}}, nil
+		})}}, nil
+	}
+	if err := svc.enableRegisterMFAWithFailover(context.Background(), first, "token", "device"); err != nil {
+		t.Fatal(err)
+	}
+	if firstCalls != 1 || secondCalls != 2 {
+		t.Fatalf("calls on failed/healthy nodes=%d/%d", firstCalls, secondCalls)
+	}
+	groups, err := store.LoadProxyGroups()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if groups[0].Nodes[0].Health.State != "unhealthy" || groups[0].Nodes[1].Health.State != "healthy" {
+		t.Fatalf("proxy health after failover=%v/%v", groups[0].Nodes[0].Health.State, groups[0].Nodes[1].Health.State)
+	}
+	if route, err := svc.resolveRegisterProxy("group:" + group.ID); err != nil || route.NodeID != group.Nodes[1].ID {
+		t.Fatalf("next registration route=%+v err=%v", route, err)
+	}
+	if account := store.LoadAccounts()[0]; account.MFAStatus != "enabled" || account.Status != "正常" {
+		t.Fatalf("account after failover: status=%q mfa=%q", account.Status, account.MFAStatus)
+	}
+}
+
+func TestRegisterMFAActivationSwitchesProxyWithoutReenrollment(t *testing.T) {
+	store := NewStore(t.TempDir())
+	defer store.Close()
+	group, err := store.SaveProxyGroup(proxyGroupInput{Name: "register", Nodes: []proxyNodeInput{
+		{URL: "http://127.0.0.1:7811"}, {URL: "http://127.0.0.1:7812"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveAccounts([]Account{{AccessToken: "token", Status: "异常", MFAStatus: "pending"}}); err != nil {
+		t.Fatal(err)
+	}
+	first := &registerSession{
+		proxyRoute: proxyRoute{URL: group.Nodes[0].URL, NodeID: group.Nodes[0].ID},
+		client: &http.Client{Transport: mfaRoundTripper(func(req *http.Request) (*http.Response, error) {
+			if strings.HasSuffix(req.URL.Path, "/enroll") {
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"secret":"GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ","session_id":"session"}`)), Header: http.Header{}}, nil
+			}
+			return nil, syscall.ECONNRESET
+		})},
+	}
+	svc := &registerService{store: store, server: &Server{store: store}, cfg: RegisterConfig{Proxy: "group:" + group.ID}}
+	svc.mfaSessionFactory = func(proxyURL string) (*registerSession, error) {
+		return &registerSession{client: &http.Client{Transport: mfaRoundTripper(func(req *http.Request) (*http.Response, error) {
+			if !strings.HasSuffix(req.URL.Path, "/activate_enrollment") {
+				t.Errorf("unexpected reenrollment on fallback: %s", req.URL.Path)
+			}
+			var body map[string]string
+			if err := json.NewDecoder(req.Body).Decode(&body); err != nil || body["session_id"] != "session" || len(body["code"]) != 6 {
+				t.Errorf("activation body=%v err=%v", body, err)
+			}
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"success":true}`)), Header: http.Header{}}, nil
+		})}}, nil
+	}
+	if err := svc.enableRegisterMFAWithFailover(context.Background(), first, "token", "device"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRegisterMFAEnrollDoesNotRetryHTTPError(t *testing.T) {
+	calls := 0
+	session := &registerSession{client: &http.Client{Transport: mfaRoundTripper(func(req *http.Request) (*http.Response, error) {
+		calls++
+		return &http.Response{StatusCode: http.StatusConflict, Body: io.NopCloser(strings.NewReader(`{}`)), Header: http.Header{}}, nil
+	})}}
+	_, err := session.registerMFARequest(context.Background(), http.MethodPost, "/enroll", "token", "device", nil)
+	if calls != 1 || err == nil || !strings.Contains(err.Error(), "HTTP 409") {
+		t.Fatalf("HTTP error retry: calls=%d err=%v", calls, err)
+	}
+}
+
+func TestFailedMFAEnrollmentClearsUnactivatedSecret(t *testing.T) {
+	store := NewStore(t.TempDir())
+	defer store.Close()
+	secret := "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
+	if err := store.SaveAccounts([]Account{{AccessToken: "token", MFAStatus: "pending", MFASecret: &secret}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.updateAccountMFA("token", "failed", ""); err != nil {
+		t.Fatal(err)
+	}
+	account := store.LoadAccounts()[0]
+	if account.MFAStatus != "failed" || account.MFASecret != nil {
+		t.Fatalf("failed enrollment retained inactive secret: status=%q secret_present=%t", account.MFAStatus, account.MFASecret != nil)
+	}
+}
+
+func TestAccountMFASetupRejectsAccountWithoutFailedEnrollment(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "config.json"), []byte(`{"auth-key":"admin-key"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := NewServer(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.store.Close()
+	if err := s.store.SaveAccounts([]Account{{AccessToken: "token", MFAStatus: "enabled"}}); err != nil {
+		t.Fatal(err)
+	}
+	request := func(admin bool) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/api/accounts/mfa/setup", strings.NewReader(`{"access_token":"token"}`))
+		if admin {
+			req.Header.Set("Authorization", "Bearer admin-key")
+		}
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, req)
+		return rec
+	}
+	if got := request(false).Code; got != http.StatusUnauthorized {
+		t.Fatalf("anonymous status=%d", got)
+	}
+	if got := request(true).Code; got != http.StatusConflict {
+		t.Fatalf("already enabled status=%d", got)
 	}
 }
 

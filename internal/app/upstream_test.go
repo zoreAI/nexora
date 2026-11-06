@@ -243,7 +243,6 @@ func TestAuthenticatedChatRequirementsPrepareFinalizeWithSolver(t *testing.T) {
 
 func TestImageConversationPrepareAndSendStates(t *testing.T) {
 	var prepareTrace string
-	var browserID string
 	client := &UpstreamClient{
 		token:    "access-token",
 		timezone: "America/Los_Angeles",
@@ -262,15 +261,13 @@ func TestImageConversationPrepareAndSendStates(t *testing.T) {
 			switch req.URL.Path {
 			case "/backend-api/f/conversation/prepare":
 				prepareTrace = req.Header.Get("X-Oai-Turn-Trace-Id")
-				browserContext, _ := body["browser_context"].(map[string]any)
-				browserID, _ = browserContext["instance_id"].(string)
 				if prepareTrace == "" || body["parent_message_id"] != clientCreatedRoot {
 					t.Errorf("prepare trace = %q, parent = %v", prepareTrace, body["parent_message_id"])
 				}
-				if browserID == "" || body["thinking_effort"] != "standard" {
-					t.Errorf("prepare browser context = %#v, thinking = %v", browserContext, body["thinking_effort"])
+				if body["thinking_effort"] != nil || body["supports_buffering"] != true {
+					t.Errorf("prepare thinking = %v, buffering = %v", body["thinking_effort"], body["supports_buffering"])
 				}
-				if body["client_prepare_state"] != "sent" || body["client_prepare_dispatch"] != "debounced" {
+				if body["client_prepare_state"] != "success" || body["client_prepare_dispatch"] != nil {
 					t.Errorf("prepare state = %v, dispatch = %v", body["client_prepare_state"], body["client_prepare_dispatch"])
 				}
 				if _, ok := body["partial_query"]; !ok {
@@ -278,11 +275,10 @@ func TestImageConversationPrepareAndSendStates(t *testing.T) {
 				}
 				return upstreamTestResponse(200, `{"conduit_token":"conduit-token"}`), nil
 			case "/backend-api/f/conversation":
-				browserContext, _ := body["browser_context"].(map[string]any)
-				if browserContext["instance_id"] != browserID || body["thinking_effort"] != "standard" {
-					t.Errorf("send browser context = %#v, thinking = %v", browserContext, body["thinking_effort"])
+				if body["thinking_effort"] != nil || body["supports_buffering"] != true {
+					t.Errorf("send thinking = %v, buffering = %v", body["thinking_effort"], body["supports_buffering"])
 				}
-				if req.Header.Get("X-Oai-Mcp-Form-Version") != "2" {
+				if req.Header.Get("X-Oai-Mcp-Form-Version") != "" {
 					t.Errorf("send MCP form version = %q", req.Header.Get("X-Oai-Mcp-Form-Version"))
 				}
 				if body["client_prepare_state"] != "success" || body["parent_message_id"] != clientCreatedRoot {
@@ -981,9 +977,11 @@ func TestImageModelSlug(t *testing.T) {
 		want  string
 	}{
 		{model: "gpt-image-2", want: "auto"},
-		{model: "gpt-image-2.5", want: "auto"},
-		{model: "gpt-image-2.5-flare", want: "auto"},
-		{model: "gpt-image-2.5-sunburst", want: "auto"},
+		{model: "gpt-image-2.5", want: "gpt-image-2.5"},
+		{model: "gpt-image-2.5-flare", want: "gpt-image-2.5-flare"},
+		{model: "gpt-image-2.5-sunburst", want: "gpt-image-2.5-sunburst"},
+		{model: "gpt-image-2.6-sunburst", want: "gpt-image-2.6-sunburst"},
+		{model: "gpt-image-2.6-flare", want: "gpt-image-2.6-flare"},
 		{model: "codex-gpt-image-2", want: "codex-gpt-image-2"},
 	} {
 		if got := imageModelSlug(tc.model); got != tc.want {
@@ -993,7 +991,7 @@ func TestImageModelSlug(t *testing.T) {
 }
 
 func TestSupportedImageModels(t *testing.T) {
-	for _, model := range []string{"gpt-image-2", "gpt-image-2.5", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst", "plus-codex-gpt-image-2"} {
+	for _, model := range []string{"gpt-image-2", "gpt-image-2.5", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst", "gpt-image-2.6-sunburst", "gpt-image-2.6-flare", "plus-codex-gpt-image-2"} {
 		if !isSupportedImageModel(model) {
 			t.Errorf("isSupportedImageModel(%q) = false", model)
 		}
@@ -1012,13 +1010,16 @@ func TestAccountImageModelSlug(t *testing.T) {
 		want        string
 	}{
 		{name: "free", defaultSlug: "auto", want: "auto"},
-		{name: "plus", defaultSlug: "gpt-6-thinking", want: "gpt-6-thinking"},
+		{name: "plus", defaultSlug: "gpt-6-thinking", want: "auto"},
 		{name: "unknown", want: "auto"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			client := &UpstreamClient{defaultModelSlug: tc.defaultSlug}
 			if got := client.imageModelSlug("gpt-image-2"); got != tc.want {
 				t.Fatalf("imageModelSlug(gpt-image-2) = %q, want %q", got, tc.want)
+			}
+			if got := client.imageModelSlug("gpt-image-2.6-sunburst"); got != "gpt-image-2.6-sunburst" || isCodexImageRequest(got, "4k") {
+				t.Fatalf("explicit Web model was replaced: %s", got)
 			}
 		})
 	}

@@ -16,7 +16,12 @@ func (s *Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodGet:
-		writeJSON(w, 200, map[string]any{"items": s.store.LoadAccounts()})
+		accounts := s.store.LoadAccounts()
+		now := time.Now()
+		for i := range accounts {
+			advanceAccountWindowStats(&accounts[i], now)
+		}
+		writeJSON(w, 200, map[string]any{"items": accounts, "pending_registrations": s.pendingRegisterAccountsFrom(accounts)})
 	case http.MethodPost:
 		var body struct {
 			Tokens         []string         `json:"tokens"`
@@ -99,6 +104,7 @@ func (s *Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 			rec["proxy"] = normalized
 		}
 		added, skipped, signupTokens := 0, 0, 0
+		recovery := s.registerRecoveryEmailSet()
 		newTokens := map[string]bool{}
 		for token := range tokset {
 			if isSignupAccessToken(token) {
@@ -123,7 +129,7 @@ func (s *Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 					added++
 				}
 			}
-			return accounts
+			return markIncompleteRegisterAccounts(accounts, recovery)
 		}); err != nil {
 			writeErr(w, http.StatusInternalServerError, "保存账号失败: "+err.Error())
 			return
@@ -134,15 +140,18 @@ func (s *Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 			failed[strAny(item["token"], "")] = true
 		}
 		merged := 0
+		recovery = s.registerRecoveryEmailSet()
 		if err := s.store.UpdateAccounts(func(accounts []Account) []Account {
+			preserveImportedPasswordEvidence(accounts, tokset, finalTokens)
 			accounts, merged = mergeImportedEmails(accounts, importedTokens, finalTokens, newTokens, failed)
-			return accounts
+			return markIncompleteRegisterAccounts(accounts, recovery)
 		}); err != nil {
 			writeErr(w, http.StatusInternalServerError, "合并同邮箱账号失败: "+err.Error())
 			return
 		}
 		added = max(0, added-merged)
 		accounts := s.store.LoadAccounts()
+		s.clearCompletedRegisterRecovery(accounts)
 		s.logSvc.add("account", "新增账号", map[string]any{"added": added, "skipped": skipped, "merged": merged, "refreshed": refreshed})
 		writeJSON(w, 200, map[string]any{"added": added, "skipped": skipped, "merged": merged, "refreshed": refreshed, "signup_tokens": signupTokens, "errors": errs, "items": accounts})
 	case http.MethodDelete:
@@ -260,6 +269,10 @@ func accountFromRecord(token, source string, rec map[string]any) Account {
 	}
 	now := nowISO()
 	a := Account{AccessToken: token, Type: typ, SourceType: source, IsSignupToken: isSignupAccessToken(token), Status: status, Quota: intAny(rec["quota"], 0), Success: intAny(rec["success"], 0), Fail: intAny(rec["fail"], 0), CreatedAt: &now, ImageQuotaUnknown: boolAny(rec["image_quota_unknown"], false)}
+	a.WindowSuccess = max(0, intAny(rec["window_success"], 0))
+	a.WindowFail = max(0, intAny(rec["window_fail"], 0))
+	a.WindowStartedAt = strAny(rec["window_started_at"], "")
+	a.WindowResetAt = strAny(rec["window_reset_at"], "")
 	a.Proxy = strings.TrimSpace(strAny(rec["proxy"], ""))
 	a.GroupID = strings.TrimSpace(strAny(rec["group_id"], ""))
 	a.ExportType = strings.TrimSpace(strAny(rec["export_type"], ""))
@@ -271,6 +284,7 @@ func accountFromRecord(token, source string, rec map[string]any) Account {
 	}
 	if v := strings.TrimSpace(strAny(rec["password"], "")); v != "" {
 		a.Password = &v
+		a.PasswordStatus = normalizePasswordStatus(strAny(rec["password_status"], ""))
 	}
 	if v := strings.TrimSpace(strAny(rec["email_password"], "")); v != "" {
 		a.EmailPassword = &v
@@ -378,7 +392,36 @@ func keysOf(m map[string]map[string]any) []string {
 	return out
 }
 
+// A fresh token may be imported with the same email/password but no status
+// metadata. Preserve the old account's successful password result across the
+// subsequent email merge; a changed password or explicit status still wins.
+func preserveImportedPasswordEvidence(accounts []Account, records map[string]map[string]any, finalTokens map[string]string) {
+	type credential struct{ email, password string }
+	accepted := map[credential]bool{}
+	for _, account := range accounts {
+		email, password := strings.ToLower(ptrString(account.Email)), ptrString(account.Password)
+		if email != "" && password != "" && account.PasswordStatus == "confirmed" {
+			accepted[credential{email, password}] = true
+		}
+	}
+	imports := map[string]bool{}
+	for token, record := range records {
+		if _, explicit := record["password_status"]; !explicit {
+			imports[firstNonEmpty(finalTokens[token], token)] = true
+		}
+	}
+	for i := range accounts {
+		if imports[accounts[i].AccessToken] && accepted[credential{strings.ToLower(ptrString(accounts[i].Email)), ptrString(accounts[i].Password)}] {
+			accounts[i].PasswordStatus = "confirmed"
+		}
+	}
+}
+
 func mergeImportedAccount(dst *Account, src Account, rec map[string]any, explicitSource bool) {
+	if _, explicit := rec["password_status"]; !explicit && src.Password != nil && ptrString(dst.Password) == ptrString(src.Password) {
+		// An export without status metadata is not a new password attempt.
+		src.PasswordStatus = ""
+	}
 	if _, ok := rec["group_id"]; ok {
 		dst.GroupID = src.GroupID
 	}
@@ -412,7 +455,13 @@ func mergeAccount(dst *Account, src Account) {
 		dst.CreatedAt = src.CreatedAt
 	}
 	if src.Password != nil {
+		if ptrString(dst.Password) != *src.Password {
+			dst.PasswordStatus = "unverified"
+		}
 		dst.Password = src.Password
+		if src.PasswordStatus != "" {
+			dst.PasswordStatus = normalizePasswordStatus(src.PasswordStatus)
+		}
 	}
 	if src.EmailPassword != nil {
 		if dst.Password != nil && *dst.Password == *src.EmailPassword && src.Password == nil {
@@ -439,6 +488,9 @@ func mergeAccount(dst *Account, src Account) {
 	}
 	if src.QuotaCheckedAt != "" {
 		dst.QuotaCheckedAt = src.QuotaCheckedAt
+	}
+	if src.ImageQuotaBaseline != nil {
+		dst.ImageQuotaBaseline = src.ImageQuotaBaseline
 	}
 	if src.SourceType != "" {
 		dst.SourceType = src.SourceType
@@ -509,8 +561,11 @@ func mergeAccount(dst *Account, src Account) {
 
 func mergeRefreshedAccount(dst *Account, info Account) {
 	status := dst.Status
+	baseline := refreshedImageQuotaBaseline(*dst, info)
+	refreshAccountWindowStats(dst, info, time.Now())
 	info.SourceType = ""
 	mergeAccount(dst, info)
+	dst.ImageQuotaBaseline = baseline
 	if status == "异常" || status == "禁用" || status == "封号" {
 		dst.Status = status
 	} else if status == "限流" {
@@ -529,6 +584,21 @@ func mergeRefreshedAccount(dst *Account, info Account) {
 	}
 }
 
+// The upstream exposes remaining quota, not the full allowance. Track an
+// observed maximum within the same reset window for a reference percentage.
+func refreshedImageQuotaBaseline(previous, info Account) *int {
+	if info.ImageQuotaUnknown {
+		return nil
+	}
+	baseline := max(0, info.Quota)
+	previousReset, previousErr := parseAccountTime(ptrString(previous.RestoreAt))
+	currentReset, currentErr := parseAccountTime(ptrString(info.RestoreAt))
+	if previous.ImageQuotaBaseline != nil && previousErr == nil && currentErr == nil && previousReset.Equal(currentReset) {
+		baseline = max(baseline, *previous.ImageQuotaBaseline)
+	}
+	return &baseline
+}
+
 func (s *Server) refreshAccountInfos(parent context.Context, tokens []string) (int, []map[string]any) {
 	refreshed, errs, _ := s.refreshAccountInfosWithFinalTokens(parent, tokens)
 	return refreshed, errs
@@ -543,6 +613,9 @@ func (s *Server) refreshAccountInfosWithFinalTokens(parent context.Context, toke
 	}
 	selected := []Account{}
 	for _, a := range s.store.LoadAccounts() {
+		if len(tokens) == 0 && isAbnormalAccountStatus(a.Status) {
+			continue
+		}
 		if len(tokens) > 0 && !want[a.AccessToken] {
 			continue
 		}
@@ -641,7 +714,7 @@ func (s *Server) refreshAccountInfoWithFinalToken(ctx context.Context, a Account
 			preflightErr = err
 		}
 	}
-	client, err := s.newUpstreamClientForAccount(a)
+	client, err := s.newAccountLoginClient(ctx, a)
 	if err != nil {
 		return err
 	}
@@ -658,7 +731,7 @@ func (s *Server) refreshAccountInfoWithFinalToken(ctx context.Context, a Account
 			}
 			if refreshErr == nil {
 				a = refreshed
-				client, err = s.newUpstreamClientForAccount(a)
+				client, err = s.newAccountLoginClient(ctx, a)
 				if err == nil {
 					info, err = client.GetUserInfo(ctx)
 				}
@@ -670,22 +743,15 @@ func (s *Server) refreshAccountInfoWithFinalToken(ctx context.Context, a Account
 			return ctx.Err()
 		}
 		oldToken := a.AccessToken
-		var relogged Account
-		var loginErr error
-		if ptrString(a.Password) != "" {
-			relogged, loginErr = s.reLoginAccountWithPasswordSecret(ctx, a, ptrString(a.MFASecret))
-		} else {
-			relogged, loginErr = s.reLoginAccountWithEmailCode(ctx, a)
-		}
+		relogged, loginErr := s.reLoginAfterRefreshAuthFailure(ctx, a, err)
 		if loginErr != nil {
-			s.markAccountRefreshAuthFailure(a, err)
-			return fmt.Errorf("令牌已过期，重新授权失败: %w", loginErr)
+			return fmt.Errorf("登录令牌已失效，重新授权失败: %w", loginErr)
 		}
 		if persistErr := s.persistReLoginAccount(oldToken, relogged); persistErr != nil {
 			return persistErr
 		}
 		a = relogged
-		client, err = s.newUpstreamClientForAccount(a)
+		client, err = s.newAccountLoginClient(ctx, a)
 		if err == nil {
 			info, err = client.GetUserInfo(ctx)
 		}
@@ -697,6 +763,29 @@ func (s *Server) refreshAccountInfoWithFinalToken(ctx context.Context, a Account
 		s.markAccountRefreshAuthFailure(a, err)
 	}
 	return err
+}
+
+func (s *Server) reLoginAfterRefreshAuthFailure(ctx context.Context, a Account, authErr error) (Account, error) {
+	var next Account
+	var err error
+	if ctx.Err() != nil {
+		return Account{}, ctx.Err()
+	}
+	if ptrString(a.Password) != "" {
+		next, err = s.reLoginAccountWithPasswordSecret(ctx, a, ptrString(a.MFASecret))
+	} else {
+		next, err = s.reLoginAccountWithEmailCode(ctx, a)
+	}
+	if err != nil && ctx.Err() == nil && !errors.Is(err, context.Canceled) {
+		// A failed reauthorization can prove deactivation more precisely than
+		// the original token error. Network/login failures retain that 401.
+		failure := authErr
+		if isAccountDeactivatedError(err) {
+			failure = err
+		}
+		s.markAccountRefreshAuthFailure(a, failure)
+	}
+	return next, err
 }
 
 func (s *Server) markAccountRefreshAuthFailure(observed Account, err error) {
@@ -843,6 +932,7 @@ func (s *Server) handleAccountsUpdate(w http.ResponseWriter, r *http.Request) {
 			targets[strings.TrimSpace(token)] = true
 		}
 		updated := 0
+		recovery := s.registerRecoveryEmailSet()
 		if err := s.store.UpdateAccounts(func(accounts []Account) []Account {
 			for i := range accounts {
 				if targets[accounts[i].AccessToken] {
@@ -855,7 +945,7 @@ func (s *Server) handleAccountsUpdate(w http.ResponseWriter, r *http.Request) {
 					updated++
 				}
 			}
-			return accounts
+			return markIncompleteRegisterAccounts(accounts, recovery)
 		}); err != nil {
 			writeErr(w, http.StatusInternalServerError, "update accounts failed")
 			return
@@ -894,7 +984,29 @@ func (s *Server) handleAccountsUpdate(w http.ResponseWriter, r *http.Request) {
 		}
 		body["group_id"] = groupID
 	}
+	if raw, ok := body["password"]; ok {
+		if _, valid := raw.(string); !valid {
+			writeErr(w, http.StatusBadRequest, "password must be a string")
+			return
+		}
+	}
+	if raw, ok := body["mfa_secret"]; ok {
+		secret, valid := raw.(string)
+		if !valid {
+			writeErr(w, http.StatusBadRequest, "mfa_secret must be a string")
+			return
+		}
+		secret = strings.ToUpper(strings.Join(strings.Fields(secret), ""))
+		if secret != "" {
+			if _, err := registerTOTP(secret, time.Now()); err != nil {
+				writeErr(w, http.StatusBadRequest, "2FA 密钥格式无效")
+				return
+			}
+		}
+		body["mfa_secret"] = secret
+	}
 	var updated *Account
+	recovery := s.registerRecoveryEmailSet()
 	if err := s.store.UpdateAccounts(func(accounts []Account) []Account {
 		for i, a := range accounts {
 			if a.AccessToken != token {
@@ -915,6 +1027,24 @@ func (s *Server) handleAccountsUpdate(w http.ResponseWriter, r *http.Request) {
 			if v, ok := body["group_id"]; ok {
 				a.GroupID = v.(string)
 			}
+			if v, ok := body["password"]; ok {
+				password := v.(string)
+				if ptrString(a.Password) != password {
+					a.PasswordStatus = "unverified"
+				}
+				a.Password = &password
+			}
+			if v, ok := body["mfa_secret"]; ok {
+				secret := v.(string)
+				if secret == "" {
+					a.MFASecret = nil
+					a.MFAStatus = ""
+				} else {
+					a.MFASecret = &secret
+					a.MFAStatus = "enabled"
+				}
+			}
+			a = markIncompleteRegisterAccounts([]Account{a}, recovery)[0]
 			accounts[i] = a
 			updated = &a
 			break
@@ -925,6 +1055,7 @@ func (s *Server) handleAccountsUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if updated != nil {
+		s.clearCompletedRegisterRecovery([]Account{*updated})
 		writeJSON(w, 200, map[string]any{"item": updated, "items": s.store.LoadAccounts()})
 		return
 	}

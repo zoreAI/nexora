@@ -137,6 +137,9 @@ func selectAccountsForRefresh(accounts []Account, tokens []string) ([]Account, i
 	all := len(tokens) == 0
 	selected := []Account{}
 	for _, account := range accounts {
+		if all && isAbnormalAccountStatus(account.Status) {
+			continue
+		}
 		if all || want[account.AccessToken] {
 			selected = append(selected, account)
 			delete(want, account.AccessToken)

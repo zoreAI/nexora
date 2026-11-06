@@ -15,36 +15,41 @@ import (
 )
 
 type Server struct {
-	root                 string
-	dataDir              string
-	imagesDir            string
-	webDist              string
-	cfg                  Config
-	store                *Store
-	mux                  *http.ServeMux
-	accMu                sync.Mutex
-	authMu               sync.Mutex
-	taskMu               sync.Mutex
-	galleryMu            sync.Mutex
-	logMu                sync.Mutex
-	imageCleanupMu       sync.Mutex
-	imageStorageMu       sync.Mutex
-	lastImageCleanup     time.Time
-	proxyCursor          uint64
-	imageEgressMu        sync.Mutex
-	imageEgressInflight  map[string]int
-	imageEgressNotify    chan struct{}
-	callStarts           map[string]time.Time
-	taskCancels          map[imageTaskKey]context.CancelFunc
-	taskRunnerOnce       sync.Once
-	imageTasks           *imageTaskRunner
-	accountPool          *accountPool
-	accountRefreshJobs   accountRefreshJobs
-	accountRepairJobs    accountRefreshJobs
-	quotaRefreshInterval atomic.Int64
-	quotaRefreshChanged  chan struct{}
-	logSvc               *logService
-	register             *registerService
+	root                       string
+	dataDir                    string
+	imagesDir                  string
+	webDist                    string
+	cfg                        Config
+	store                      *Store
+	mux                        *http.ServeMux
+	accMu                      sync.Mutex
+	authMu                     sync.Mutex
+	accountMFALocks            accountOperationLocks
+	accountRecoveryLocks       accountOperationLocks
+	taskMu                     sync.Mutex
+	galleryMu                  sync.Mutex
+	logMu                      sync.Mutex
+	imageCleanupMu             sync.Mutex
+	imageStorageMu             sync.Mutex
+	lastImageCleanup           time.Time
+	proxyCursor                uint64
+	mihomoMu                   sync.Mutex
+	imageEgressMu              sync.Mutex
+	imageEgressInflight        map[string]int
+	imageEgressNotify          chan struct{}
+	callStarts                 map[string]time.Time
+	taskCancels                map[imageTaskKey]context.CancelFunc
+	taskRunnerOnce             sync.Once
+	imageTasks                 *imageTaskRunner
+	accountPool                *accountPool
+	accountRefreshJobs         accountRefreshJobs
+	accountRepairJobs          accountRefreshJobs
+	codexAuthJobs              codexAuthBatchJobs
+	quotaRefreshInterval       atomic.Int64
+	quotaRefreshChanged        chan struct{}
+	accountLoginSessionFactory func(string, int) (*registerSession, error)
+	logSvc                     *logService
+	register                   *registerService
 }
 
 func NewServer(root string) (*Server, error) {
@@ -101,6 +106,10 @@ func NewServer(root string) (*Server, error) {
 		return nil, s.register.initErr
 	}
 	s.register.server = s
+	if err := s.reconcileRegisterRecoveryAccounts(); err != nil {
+		s.store.Close()
+		return nil, fmt.Errorf("restore incomplete registration states: %w", err)
+	}
 	if err := s.recoverUnfinishedTasks(); err != nil {
 		s.store.Close()
 		return nil, err
@@ -224,9 +233,18 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/accounts/refresh/progress/", s.handleAccountsRefreshProgress)
 	s.mux.HandleFunc("/api/accounts/repair/start", s.handleAccountsRepairStart)
 	s.mux.HandleFunc("/api/accounts/repair/progress/", s.handleAccountsRepairProgress)
+	s.mux.HandleFunc("/api/codex-auth/batch/start", s.handleCodexAuthBatchStart)
+	s.mux.HandleFunc("/api/codex-auth/batch/", func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/export") {
+			s.handleCodexAuthBatchExport(w, r)
+			return
+		}
+		s.handleCodexAuthBatchProgress(w, r)
+	})
 	s.mux.HandleFunc("/api/accounts/update", s.handleAccountsUpdate)
 	s.mux.HandleFunc("/api/accounts/mfa/code", s.handleAccountMFACode)
 	s.mux.HandleFunc("/api/accounts/mfa/login", s.handleAccountMFALogin)
+	s.mux.HandleFunc("/api/accounts/mfa/setup", s.handleAccountMFASetup)
 	s.mux.HandleFunc("/api/account-groups", s.handleAccountGroups)
 	s.mux.HandleFunc("/api/account-groups/", s.handleAccountGroupID)
 	s.mux.HandleFunc("/api/settings", s.handleSettings)
@@ -277,6 +295,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/sub2api/servers", s.handleSub2APIServers)
 	s.mux.HandleFunc("/api/sub2api/servers/", s.handleSub2APIServerID)
 	s.mux.HandleFunc("/api/register", s.handleRegister)
+	s.mux.HandleFunc("/api/register/mihomo/groups", s.handleRegisterMihomo)
+	s.mux.HandleFunc("/api/register/mihomo/apply", s.handleRegisterMihomo)
 	s.mux.HandleFunc("/api/register/start", s.handleRegisterStart)
 	s.mux.HandleFunc("/api/register/stop", s.handleRegisterStop)
 	s.mux.HandleFunc("/api/register/reset", s.handleRegisterReset)
